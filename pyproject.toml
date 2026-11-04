@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meeting-asr-server"
+version = "0.2.0"
+description = "Qwen3-ASR + Community-1 meeting transcription with speaker timestamps"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "numpy>=2.0,<3",
+    "soundfile>=0.13,<0.14",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+    "python-multipart>=0.0.20,<1",
+    "python-dotenv>=1,<2",
+    "httpx>=0.28,<1",
+]
+
+[project.optional-dependencies]
+gpu = ["qwen-asr==0.0.6", "pyannote-audio==4.0.7", "torch>=2.8,<2.9", "torchaudio>=2.8,<2.9", "torchcodec>=0.7,<0.8"]
+test = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[project.scripts]
+meeting-asr = "transcribe:main"
+meeting-asr-batch = "batch_transcribe:main"
+
+[tool.setuptools]
+py-modules = ["app", "transcribe", "batch_transcribe", "pipeline", "audio", "alignment", "config", "clients", "gpu_services", "jobs", "offline_docs"]
+packages = ["swagger_assets"]
+
+[tool.setuptools.package-data]
+swagger_assets = ["*.js", "*.css", "*.png", "*.txt", "LICENSE", "NOTICE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+

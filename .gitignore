@@ -1,0 +1,17 @@
+.venv/
+.cache/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+models/
+outputs/
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.tar
+*.tar.gz
+
