@@ -7,7 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfi
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY pyproject.toml ./
+COPY requirements-gpu.txt ./
 COPY *.py ./
 COPY swagger_assets ./swagger_assets
-RUN python -m pip install '.[gpu]'
+RUN python -m pip install . -r requirements-gpu.txt
 EXPOSE 8002 8003

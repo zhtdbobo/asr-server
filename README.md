@@ -71,7 +71,7 @@ docker build -f Dockerfile.gpu -t meeting-gpu:offline .
 docker save -o meeting-gpu.tar meeting-gpu:offline
 ```
 
-使用 `Dockerfile.gpu`，无需 `--target` 或 `docker compose build`。`Dockerfile.api` 保留为可选部署方式，当前方案不使用。若此前已打包旧镜像，本地目录校验、离线文档及固定离线加载逻辑需要重新构建、导入 GPU 镜像后生效。
+使用 `Dockerfile.gpu`，无需 `--target` 或 `docker compose build`。GPU 依赖单独放在 `requirements-gpu.txt`，由 GPU 镜像构建时安装；主项目不再声明 `gpu` 可选依赖。`Dockerfile.api` 保留为可选部署方式，当前方案不使用。若此前已打包旧镜像，本地目录校验、离线文档及固定离线加载逻辑需要重新构建、导入 GPU 镜像后生效。
 
 将 `meeting-gpu.tar`、`models/`、`compose.yaml` 和配置好的 `.env.gpu` 拷到内网 GPU 服务器同一目录。服务器预先安装 Docker Compose 和 NVIDIA GPU 容器支持，驱动需兼容 CUDA 12.8 运行环境，然后执行：
 
@@ -157,7 +157,24 @@ SQLite 队列支持单节点持久化和重启恢复：运行中断的任务重�
 
 ## 云桌面直接启动主 API
 
-云桌面无需 GPU、模型权重或 Docker。用 VS Code 打开项目，准备好 `.env`、项目基础依赖和 FFmpeg，再从项目根目录运行：
+可以把项目源码直接复制到云桌面。保留 `.env`、Python 源文件、`swagger_assets/`、`pyproject.toml` 和 `uv.lock`；无需复制 `.venv/`、`.cache/`、`build/`、`dist/` 或 `models/`。虚拟环境应在目标云桌面重新创建，不能跨机器直接复用。
+
+云桌面无需 GPU、模型权重或 Docker。安装 Python 3.10～3.13（建议 3.12）、uv 和 FFmpeg；配置 `.env` 后，在项目根目录执行：
+
+```bash
+uv sync
+uv run --no-sync python -m uvicorn app:app --host 0.0.0.0 --port 8010 --workers 1
+```
+
+批处理也可直接通过 uv 运行：
+
+```bash
+uv run --no-sync python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果"
+```
+
+`uv sync` 只安装主项目基础依赖，不解析或安装 `requirements-gpu.txt` 中的 PyTorch、CUDA、Qwen 和 pyannote 依赖。此前 GPU 依赖放在同一个项目的可选依赖中，uv 创建通用锁文件时会一起解析，即使默认同步时未选择安装它们。现在已经分离；不要再使用旧的 `uv sync --extra gpu` 或 `pip install '.[gpu]'`。
+
+如果基础依赖已经通过离线包安装，也可从项目根目录直接运行：
 
 ```bash
 python -m uvicorn app:app --host 0.0.0.0 --port 8010 --workers 1
@@ -165,7 +182,7 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8010 --workers 1
 
 在云桌面浏览器访问 `http://localhost:8010/docs`；其他客户端访问 `http://云桌面IP:8010`。确认云桌面能访问 GPU 服务器的 8001、8002、8003 端口。录音、任务队列和结果保存在云桌面，模型文件仅在 GPU 服务器上。
 
-云桌面仅安装基础依赖，不安装 `.[gpu]`。离线安装时，在与云桌面操作系统、Python 版本和架构匹配的联网环境准备 wheel 包：
+`uv sync` 首次安装需要访问可用的 Python 包源，单独复制源码不能替代依赖安装。完全离线的云桌面需提前准备依赖包；在与云桌面操作系统、Python 版本和架构匹配的联网环境准备 wheel 包：
 
 ```bash
 python -m pip wheel --wheel-dir wheelhouse .
@@ -178,6 +195,8 @@ python -m pip install --no-index --find-links=wheelhouse meeting-asr-server
 ```
 
 FFmpeg 需另外准备并加入云桌面的 PATH。
+
+如果报 `NumPy was built with baseline optimizations (X86_V2) but your machine doesn't support (X86_V2)`，说明云桌面当前 CPU 特性不满足所装 NumPy 的要求。NumPy 2.4 起提高了 x86 默认编译基线，部分虚拟机未暴露这些指令集。本项目将 NumPy 限制为 `>=2.0,<2.4`；更新 `pyproject.toml` 和 `uv.lock` 后执行 `uv sync`，再用 `uv run --no-sync python -c "import numpy; print(numpy.__version__)"` 确认导入正常，然后重跑批处理。此错误出现在云桌面的音频预处理阶段，不涉及远程模型推理。版本限制依据见 [NumPy 2.4 发布说明](https://numpy.org/doc/2.4/release/2.4.0-notes.html#modulate-dispatched-x86-cpu-features)。
 
 ## 文件夹批量处理
 
