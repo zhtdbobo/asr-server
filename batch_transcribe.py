@@ -3,8 +3,9 @@
 import argparse
 import json
 import logging
+import math
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
@@ -29,6 +30,38 @@ AUDIO_EXTENSIONS = {
     ".caf",
     ".mka",
 }
+
+
+def comparison_segments(result: dict | list) -> list[dict]:
+    """Use the same four-field array as the TextGrid reference export."""
+    records = result.get("segments") if isinstance(result, dict) else result
+    if not isinstance(records, list):
+        raise TypeError("识别结果缺少 segments 数组")
+    segments = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise TypeError("片段必须是包含 speaker/start/end/text 的对象")
+        try:
+            speaker, text = record["speaker"], record["text"]
+            start, end = record["start"], record["end"]
+        except KeyError as exc:
+            raise ValueError(f"片段缺少字段: {exc.args[0]}") from exc
+        if not isinstance(speaker, str) or not speaker.strip() or not isinstance(text, str):
+            raise ValueError("speaker 必须为非空字符串，text 必须为字符串")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in (start, end)
+        ):
+            raise ValueError("片段起止时间必须是有限数值")
+        if start < 0 or end < start:
+            raise ValueError(f"片段时间区间无效: {start} -> {end}")
+        if text.strip():
+            segments.append({"speaker": speaker, "start": start, "end": end, "text": text.strip()})
+    return sorted(
+        segments, key=lambda segment: (segment["start"], segment["end"], segment["speaker"])
+    )
 
 
 def discover_audio(folder: Path, output_dir: Path, recursive: bool) -> list[Path]:
@@ -83,43 +116,89 @@ def run_batch(
         raise ValueError("文件夹中没有支持的音频文件；如音频在子目录，请加 --recursive")
     options = options or {}
     started = perf_counter()
+    print(
+        f"找到 {len(files)} 个音频，最多同时处理 {workers} 个；JSON 用于对比，TXT 用于阅读。",
+        flush=True,
+    )
 
     def process(path):
         relative = path.relative_to(folder)
         # Retain the extension so meeting.wav and meeting.mp3 cannot overwrite each other.
         text_path = output_dir / relative.parent / f"{relative.name}.txt"
         json_path = output_dir / relative.parent / f"{relative.name}.json"
+        full_json_path = output_dir / relative.parent / f"{relative.name}.full.json"
         item = {
             "file": relative.as_posix(),
             "text_file": str(text_path),
             "json_file": str(json_path),
         }
-        if skip_existing and text_path.is_file() and json_path.is_file():
-            return {**item, "status": "skipped"}
         try:
+            if skip_existing and text_path.is_file() and json_path.is_file():
+                try:
+                    existing = json.loads(json_path.read_text(encoding="utf-8-sig"))
+                    segments = comparison_segments(existing)
+                except (ValueError, TypeError, OSError) as exc:
+                    print(f"[重新处理] {relative}: 已有 JSON 无效（{exc}）", flush=True)
+                else:
+                    # Migrate the old full-result JSON without repeating GPU inference.
+                    updates = {}
+                    if isinstance(existing, dict):
+                        updates[full_json_path] = (
+                            json.dumps(existing, ensure_ascii=False, indent=2) + "\n"
+                        )
+                    if existing != segments:
+                        updates[json_path] = (
+                            json.dumps(segments, ensure_ascii=False, indent=2) + "\n"
+                        )
+                    if updates:
+                        write_outputs(updates)
+                    if full_json_path.is_file():
+                        item["full_json_file"] = str(full_json_path)
+                    return {**item, "status": "skipped", "json_updated": bool(updates)}
+            print(f"[开始] {relative}", flush=True)
             result = pipeline.transcribe(path, **options)
+            segments = comparison_segments(result)
             write_outputs(
                 {
                     text_path: result["formatted_text"] + "\n",
-                    json_path: json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                    json_path: json.dumps(segments, ensure_ascii=False, indent=2) + "\n",
+                    full_json_path: json.dumps(result, ensure_ascii=False, indent=2) + "\n",
                 }
             )
-            return {**item, "status": "completed"}
+            return {**item, "full_json_file": str(full_json_path), "status": "completed"}
         except Exception as exc:  # noqa: BLE001 - A failed input must not abort other files.
             return {**item, "status": "failed", "error": str(exc)}
 
     results = []
     labels = {"completed": "成功", "failed": "失败", "skipped": "跳过"}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = [pool.submit(process, path) for path in files]
-        for future in as_completed(pending):
-            item = future.result()
-            results.append(item)
-            suffix = f"：{item['error']}" if item["status"] == "failed" else ""
-            print(
-                f"[{len(results)}/{len(files)}] {labels[item['status']]} {item['file']}{suffix}",
-                flush=True,
-            )
+        pending = {pool.submit(process, path): path for path in files}
+        while pending:
+            done, _ = wait(pending, timeout=15, return_when=FIRST_COMPLETED)
+            if not done:
+                running = [
+                    path.relative_to(folder).as_posix()
+                    for future, path in pending.items()
+                    if future.running()
+                ]
+                print(
+                    f"[等待] 已结束 {len(results)}/{len(files)} 个，"
+                    f"本批次已耗时 {perf_counter() - started:.0f} 秒；"
+                    f"正在处理: {', '.join(running) or '等待工作线程'}；"
+                    "当前阶段见上方处理日志。",
+                    flush=True,
+                )
+            for future in done:
+                pending.pop(future)
+                item = future.result()
+                results.append(item)
+                suffix = f"：{item['error']}" if item["status"] == "failed" else ""
+                if item.get("json_updated"):
+                    suffix += "（已有 JSON 已统一为对比格式）"
+                print(
+                    f"[{len(results)}/{len(files)}] {labels[item['status']]} {item['file']}{suffix}",
+                    flush=True,
+                )
 
     report = {
         "input_dir": str(folder),
@@ -146,7 +225,12 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/batch"))
     parser.add_argument("--recursive", action="store_true", help="同时处理子文件夹")
     parser.add_argument("--workers", type=int, default=1, help="同时处理文件数，默认 1")
-    parser.add_argument("--skip-existing", action="store_true", help="TXT、JSON 均已存在时跳过")
+    parser.add_argument(
+        "--skip-existing", action="store_true", help="复用已有 TXT、JSON；旧 JSON 自动转换"
+    )
+    parser.add_argument(
+        "--timeout-seconds", type=float, help="每次远程请求的读写等待超时秒数，默认读取 .env"
+    )
     parser.add_argument("--language", default="Chinese")
     parser.add_argument("--num-speakers", type=int)
     parser.add_argument("--min-speakers", type=int)
@@ -161,6 +245,8 @@ def main(argv=None):
             args.language, args.num_speakers, args.min_speakers, args.max_speakers
         )
         settings = replace(Settings.from_env(), job_workers=args.workers)
+        if args.timeout_seconds is not None:
+            settings = replace(settings, api_timeout_seconds=args.timeout_seconds)
         if not settings.asr_api_url:
             raise ValueError("请先在 .env 中配置 ASR_API_URL")
         pipeline = MeetingPipeline(settings)

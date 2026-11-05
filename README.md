@@ -1,6 +1,6 @@
 # 云桌面主 API + 远程三个 GPU 服务
 
-复用你已经部署的 `POST /v1/audio/transcriptions`：通过 multipart 上传音频，传入 `model`、`response_format=json`、`stream=false`，读取响应的 `text`。本项目不再加载 Qwen3-ASR 权重。
+复用你已经部署的 `POST /v1/audio/transcriptions`：通过 multipart 上传音频，传入 `model`、`response_format=json`、`stream=true`、`temperature=0` 和 `max_completion_tokens`，读取 SSE 转写事件并汇总为正文。流式读取用于提前停止异常生成及识别截断，不改变主 API、TXT 和 JSON 的结果格式。本项目不再加载 Qwen3-ASR 权重。
 
 ```text
 云桌面：Python 主 API :8010 / 持久化任务队列
@@ -67,9 +67,23 @@ hf download Qwen/Qwen3-ForcedAligner-0.6B --local-dir ./models/Qwen3-ForcedAlign
 在与 GPU 服务器架构相同的联网 Docker 环境构建一次 GPU 镜像，供两个 GPU 容器共用：
 
 ```bash
-docker build -f Dockerfile.gpu -t meeting-gpu:offline .
+docker buildx version
+docker buildx build --load --progress=plain -f Dockerfile.gpu -t meeting-gpu:offline .
 docker save -o meeting-gpu.tar meeting-gpu:offline
 ```
+
+如果提示 `legacy builder is deprecated` 且 `docker buildx` 不存在，请先安装与你的 Docker 来源匹配的 Buildx。Ubuntu 通过发行版仓库安装 `docker.io` 时，对应包是 `docker-buildx`：`sudo apt-get install --no-install-recommends docker-buildx`；Docker 官方 CE 仓库使用的包名则是 `docker-buildx-plugin`。安装后运行 `docker buildx version` 确认，再执行上面的构建命令，无需为安装 CLI 插件重启 Docker。
+
+WSL 中建议从 Linux 文件系统构建。若项目在 `/mnt/c` 或 `/mnt/d`，可以在项目目录执行下面命令，只复制源码和构建所需文件，再从副本构建；模型、录音、配置密钥和虚拟环境无需复制：
+
+```bash
+task_build_dir=$(mktemp -d /tmp/asr-gpu-build.XXXXXXXX)
+cp -a Dockerfile.gpu .dockerignore pyproject.toml requirements-gpu.txt *.py swagger_assets "$task_build_dir/"
+cd "$task_build_dir"
+docker buildx build --load --progress=plain -f Dockerfile.gpu -t meeting-gpu:offline .
+```
+
+`--load` 将构建结果加载到本机 Docker，供后续 `docker save` 和 Compose 使用；`--progress=plain` 输出完整阶段和耗时。旧构建器停在 `COPY` 时，应先检查 Docker 服务响应和存储状况；该步骤尚未执行 Python 依赖安装。不要仅凭 `df` 中 WSL 虚拟磁盘的最大余量判断宿主机物理盘空间充足。
 
 使用 `Dockerfile.gpu`，无需 `--target` 或 `docker compose build`。GPU 依赖单独放在 `requirements-gpu.txt`，由 GPU 镜像构建时安装；主项目不再声明 `gpu` 可选依赖。`Dockerfile.api` 保留为可选部署方式，当前方案不使用。若此前已打包旧镜像，本地目录校验、离线文档及固定离线加载逻辑需要重新构建、导入 GPU 镜像后生效。
 
@@ -149,7 +163,11 @@ MAX_UPLOAD_MB=500
 MAX_AUDIO_SECONDS=3600
 ```
 
-`ASR_CHUNK_SECONDS` 默认 30 秒，在低能量位置切分且不丢失样本，不能超过 180 秒；说话人分离始终使用整段录音，保持统一编号。分块转写可能影响边界处的识别效果，应使用目标录音验证。增加执行任务数会增加 CPU 内存、解码和网络开销，GPU 服务的等待也计入请求超时；根据真实录音长度、各阶段延迟和显存压测调节。请求限流、TLS 和每用户配额应在入口网关配置。
+`ASR_CHUNK_SECONDS` 默认 30 秒，在低能量位置切分且不丢失样本，不能超过 180 秒。主流程先解码为 16 kHz 单声道，另存一份整段 PCM16 临时 WAV 上传给说话人服务，聚类完成后删除临时文件，保持整段录音的统一编号与原始时间轴；不再上传原始多通道大文件。16 kHz、16 位、8 通道音频总码率为 2048 kbps，每小时约 879 MiB；同采样率的单声道 PCM16 每小时约 110 MiB，默认一小时录音可在 GPU 服务的 500 MiB 文件限制内上传。对外 API 的原始上传大小仍由 `MAX_UPLOAD_MB` 控制。
+
+每个分块在送去对齐前检查 ASR 文本长度：上限为每秒 40 字符，至少允许 256 字符，最多 4096 字符，用于拦截异常长文本。对齐结果会检查字词起止时间、顺序和文本完整性。文本异常过长、ASR 明确返回截断、时间戳无效或对齐文本不完整时，只将当前异常音频块二等分，重新识别和对齐；最多拆分 3 层，子块不小于 5 秒。先前块不重复处理，异常块的部分文本不会混入成功输出，恢复情况记录在 `.full.json` 的 `warnings` 中。达到重试边界后仍失败时，错误会包含分块的原录音位置、无效字词的时间戳及音频块时长；不按猜测换算时间单位或补造时间戳。连接失败等服务错误沿用 HTTP 重试机制，不触发音频细分。
+
+分块转写及异常块重新识别可能影响边界处的识别效果，应使用目标录音验证。增加执行任务数会增加 CPU 内存、解码和网络开销，GPU 服务的等待也计入请求超时；根据真实录音长度、各阶段延迟和显存压测调节。请求限流、TLS 和每用户配额应在入口网关配置。
 
 SQLite 队列支持单节点持久化和重启恢复：运行中断的任务重新排队，未完成上传会清理。**每个 `JOB_DIRECTORY` 只能运行一个 API 进程，保持 `--workers 1`**。每个独立 GPU 服务也保持一个 worker，避免重复加载权重。当前队列不是多主机分布式调度系统；需要多个 API 副本共享全局队列时应替换为 Redis/RabbitMQ 等独立队列。
 
@@ -212,11 +230,116 @@ python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果"
 python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --recursive --workers 2 --skip-existing
 ```
 
-每个音频保存两份结果，例如 `会议.wav.txt`（发言人、时间戳、正文）和 `会议.wav.json`（完整结果），保留输入子目录结构。文件名保留原扩展名，避免同名 WAV 和 MP3 相互覆盖。单文件失败后继续，结束时保存 `batch-summary.json`，列出每个文件的状态、输出位置和失败原因；有失败时脚本退出码为 1，全部成功或跳过时为 0。
+每个音频保存以下结果，并保留输入子目录结构：
 
-`--skip-existing` 仅在对应 TXT、JSON 都存在时跳过；默认重新处理并覆盖对应输出。修改输入音频、模型或识别参数后，应省略此选项重新处理。还支持 `--language`、`--num-speakers`、`--min-speakers`、`--max-speakers`；文件间人数不同可不指定，让模型分别判断。每个音频的发言人编号独立。
+- `会议.wav.txt`：保持原来的发言人、时间戳、正文排版，方便阅读。
+- `会议.wav.json`：与 TextGrid 转换结果相同的片段数组，每项仅包含 `speaker`、`start`、`end`、`text`，时间单位为秒，按开始时间排序，方便对比。
+- `会议.wav.full.json`：完整识别结果，包含 `segments`、字词时间戳、说话人时间线、耗时和警告，方便排查问题。
+
+文件名保留原音频扩展名，避免同名 WAV 和 MP3 相互覆盖。单文件失败后继续，结束时保存 `batch-summary.json`，列出每个文件的状态、输出位置和失败原因；有失败时脚本退出码为 1，全部成功或跳过时为 0。同步 API 和单文件 `transcribe.py` 仍输出完整结果对象。
+
+`--skip-existing` 在对应 TXT 和有效 JSON 都存在时复用结果。如果 JSON 来自旧版本的完整结果对象，会将其转为片段数组，并把原完整内容保存到 `.full.json`，不重复调用推理服务，TXT 保持原样；无效 JSON 或缺少 TXT/JSON 时重新处理。默认不加此参数时重新处理并覆盖输出。修改输入音频、模型或识别参数后，应省略此选项重新处理。还支持 `--language`、`--num-speakers`、`--min-speakers`、`--max-speakers`；文件间人数不同可不指定，让模型分别判断。每个音频的发言人编号独立。
+
+终端会显示当前文件、音频时长、分块时间范围、ASR/时间戳对齐阶段，以及请求开始、耗时和重试次数。如果 15 秒内没有文件完成，会打印当前处理的文件与本批次耗时。HTTP 200 只代表该次请求成功，不能据此判断整段录音已经处理完；同一录音还可能继续请求后续分块。
+
+Community-1 和 ForcedAligner 的读写等待超时由 `.env` 的 `API_TIMEOUT_SECONDS` 控制，默认 600 秒，连接异常或部分临时 HTTP 错误最多尝试 3 次。可以在本次批处理中覆盖公共超时，例如：
+
+```bash
+python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --skip-existing --timeout-seconds 120
+```
+
+ASR 单独使用 `ASR_TIMEOUT_SECONDS`，默认 90 秒，实际等待上限取它和公共超时的较小值；每收到一行流式数据也检查已耗时，持续生成超过该设置时关闭响应。HTTP 读写超时限制的是一次网络等待，并非严格的整段录音总时限。ASR 连接失败或超时不自动重复提交，避免旧生成尚未取消时继续堆积请求。若终端停留在某个阶段，结合对应服务日志检查该请求。
+
+如果某个约 30 秒的块持续几分钟不结束，而 vLLM 日志中 `Running: 1 reqs`、生成 token 数和 KV cache 持续增长，说明模型仍在生成，可能出现重复输出或未正常生成结束标记。客户端默认每次请求最多生成 1024 tokens，并在流式正文超过该块字符预算时提前关闭响应。达到 token 上限（`finish_reason=length`）或正文异常长时，会将该音频块对半切分后重新识别、对齐，最多细分 3 层，最小子块约 5 秒；仍异常则报告文件失败，保留失败原因，不把截断正文当作完整结果。断流或没有正常结束标记同样报错。
+
+可在云桌面 `.env` 中调整 ASR 请求限制：
+
+```dotenv
+ASR_MAX_COMPLETION_TOKENS=1024
+ASR_TIMEOUT_SECONDS=90
+```
+
+现有 ASR 容器和模型可以继续使用。关键是每次转写请求明确携带 `max_completion_tokens`，不能只依赖启动时的默认生成配置：例如 vLLM 0.14.0 的转写实现，在请求未指定该参数时使用 `max_model_len` 作为生成预算。请求长度控制及流式结束原因见 [vLLM 0.14.0 转写源码](https://github.com/vllm-project/vllm/blob/v0.14.0/vllm/entrypoints/openai/speech_to_text.py)。本项目要求转写接口支持 SSE；若服务忽略 `stream=true`，会明确报错，避免静默接收无法判断是否截断的 JSON。
+
+若旧请求仍在持续生成，先停止旧批处理，再在已有 `qwen3-asr` 容器中停止当前 `qwen-asr-serve` 进程，重新启动以清除旧生成；不要同时启动第二个进程占用同一 GPU/端口。可继续用原来的模型路径和显存配置，监听地址使用 vLLM 的 `--host` 参数：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 qwen-asr-serve \
+  /data/shared/Qwen3-ASR/models/Qwen3-ASR-1.7B \
+  --gpu-memory-utilization 0.9 \
+  --host 0.0.0.0 --port 80
+```
+
+这里 1024 是本项目每个音频块的输出 token 上限，不表示音频秒数。本次 ASR 防护只需更新云桌面 `clients.py`、`config.py`，不需重打 Community-1 和 ForcedAligner 两个 GPU 服务的镜像。用 `--skip-existing` 重跑可复用已完成文件；尚未完成的文件从头处理，不从中间分块续跑。已提交的旧请求不会自动获得新的生成上限，关闭客户端响应后还应查看 ASR 日志，确认旧生成已经取消。
+
+如果遇到 AliMeeting 原始多通道 WAV 上传 Community-1 时返回 HTTP 413，请将更新后的 `pipeline.py` 和 `clients.py` 同步到云桌面实际运行目录后，结束旧批处理，再用 `--skip-existing` 重新启动。主流程会上传整段单声道 PCM16，不需要单纯调大 GPU 上传限制。处理失败的文件会重试，已有有效 TXT/JSON 的文件会复用。
+
+对齐服务自身也会在 GPU 推理前拒绝异常长文本。此防护位于 `gpu_services.py`，如需更新服务端，须用新源码重建 `meeting-gpu:offline` 镜像、拷到内网后重新 `docker load`，再执行 `docker compose --env-file .env.gpu up -d --no-build --pull never --force-recreate aligner`。仅重启旧容器不会更新镜像中的源码；重建和重新部署流程见前面的离线部署说明。已在旧服务中开始执行的超长请求不会被客户端更新取消。
 
 `--workers` 控制本次脚本的并发文件数，独立于运行中的 API 进程；脚本和 API 同时运行时，远程服务承受两者合计的请求。此脚本是一次性批处理，不会持续监控目录，也不将任务写入 API 的 SQLite 队列。运行环境仍需基础 Python 依赖和 FFmpeg，模型和 GPU 继续位于服务器。
+
+## AliMeeting 标注转 JSON
+
+`textgrid_to_json.py` 仅使用 Python 标准库，无需安装额外依赖、配置远程服务或加载模型。转换单个标注文件：
+
+```bash
+python textgrid_to_json.py "D:/AliMeeting/会议.TextGrid" --output "outputs/reference/会议.json"
+```
+
+递归转换整个 Eval 数据目录，每个 TextGrid 生成一个 JSON，保留输入子目录结构：
+
+```bash
+python textgrid_to_json.py "D:/AliMeeting/Eval_Ali" --output-dir "outputs/reference/Eval_Ali"
+```
+
+也可只传入 `Eval_Ali_far/textgrid_dir`，只转换远场标注。默认输出目录为 `outputs/reference`；同名输出会覆盖。单个文件失败时继续处理其他文件，打印失败路径和原因，最终退出码为 1；全部成功为 0。
+
+每个 JSON 是片段数组，与批处理 `会议.wav.json` 使用相同结构；同步 API 或 `.full.json` 则从 `segments` 提取对应片段。例如：
+
+```json
+[
+  {"speaker": "SPK0093", "start": 1.25, "end": 4.8, "text": "我们先讨论一下今天的安排"},
+  {"speaker": "SPK0094", "start": 4.2, "end": 6.1, "text": "好的我先说一下"}
+]
+```
+
+起止时间沿用原录音时间轴，单位为秒。跳过空白文本区间和没有时长的点标注层（TextTier），按开始时间排序，保留不同说话人的重叠发言及文本中的标点、特殊标记。AliMeeting 层名中的 `SPKxxxx` 提取为说话人 ID；近场层名不含 ID 时尝试从文件名提取；其他层名原样作为说话人。支持 Praat 完整/短文本格式、双引号转义及跨行文本，自动读取 UTF-8（含 BOM）和带 BOM 的 UTF-16；旧编码可用 `--encoding gb18030` 等指定。二进制 TextGrid 需先在 Praat 中另存为文本。
+
+人工标注的 `SPKxxxx` 与模型输出的聚类 ID、`发言人1` 等编号没有直接对应关系，对比说话人归属前需要按当前录音建立映射。参考标注按原始片段保存，模型结果可能合并多个片段，对比文本或时间戳时应按时间轴对齐。远场 WAV 文件名还可能包含额外的麦克风后缀，匹配 JSON 与音频时请核对会议编号。
+
+## 识别结果与 reference 对比
+
+`compare_transcripts.py` 只使用 Python 标准库，无需 GPU 或安装额外依赖。比较远场识别结果和之前生成的远场 reference，Windows PowerShell/CMD 均可运行下面这一行：
+
+```bash
+python compare_transcripts.py --reference "outputs/reference/Eval_Ali/Eval_Ali_far/textgrid_dir" --hypothesis "outputs/transcribe" --output-dir "outputs/comparison"
+```
+
+将 `--hypothesis` 改成批处理实际的输出目录；脚本递归搜索 JSON。也支持直接指定两个 JSON 文件，不要求文件名一致：
+
+```bash
+python compare_transcripts.py --reference "outputs/reference/Eval_Ali/Eval_Ali_far/textgrid_dir/R8001_M8004.json" --hypothesis "outputs/transcribe/R8001_M8004_MS801.wav.json" --output-dir "outputs/comparison"
+```
+
+比较逻辑不要求段数、边界或说话人名称一致：
+
+- 自动匹配 `R8001_M8004_MS801.wav.json` 与 `R8001_M8004.json`，也支持普通同名录音；近场的 `_N_SPKxxxx` 不会当作远场参考。存在多个候选时报告歧义，不随意选取。
+- 每份录音独立按时间重合总量建立最优的一一说话人映射，例如 `SPEAKER_00 → SPK8013`，不用编号本身判断对错。多识别或少识别的说话人不会被丢弃。
+- **按时间映射的分说话人 CER**：将映射后的同一说话人文本按开始时间拼接，再计算字符编辑距离。标注分成三段、识别合成一段时，只要文字相同，CER 就为 0；不按行逐段配对。该指标同时反映文字和说话人归属，不是忽略说话人的全文 CER，也不是按文本另求最优排列的 cpCER。
+- 默认归一化全半角、大小写，忽略标点、符号和空白；保留汉字、字母、数字、组合标记和“嗯、啊”等语气词。不自动转换简繁体、数字读法，也不自动删除标注中的噪声标签。确需排除方括号/尖括号标签时，可显式加 `--ignore-pattern "\[[^\]]*\]|<[^>]*>"`，同样应用于参考和识别正文。
+- **片段时间线 DER**：计算漏检、误检、说话人混淆的时长之和，除以参考说话人总时长。采用零边界容差，包含重叠讲话；同一说话人自身重叠的区间只计一次。只改变分段边界而覆盖时间不变，不增加 DER；若合并片段填补了参考中的静音间隔，这段额外覆盖会计入误检。
+
+这里 DER 评估的是输入 `segments` 的时间线。主流程会合并发言片段，因此它与 `.full.json` 内原始 `diarization` 的独立模型评分不同；即使传完整结果对象，也统一从 `segments` 取数据。本工具用于当前流程诊断，不代替 AliMeeting 官方评测协议。CER 定义参见 [TorchMetrics 文档](https://lightning.ai/docs/torchmetrics/stable/text/char_error_rate)，说话人映射及 DER 定义参见 [pyannote.metrics 文档](https://pyannote.github.io/pyannote-metrics/reference.html#pyannote.metrics.diarization.DiarizationErrorRate)。
+
+输出目录包含：
+
+- `comparison-report.txt`：汇总、每个文件的 CER/DER、说话人映射，以及每位说话人的完整参考/识别正文，方便人工对照。
+- `comparison-report.json`：详细映射、各说话人编辑错误数、漏检/误检/混淆秒数及警告。
+- `comparison-files.csv`：每个文件一行的指标表，UTF-8 BOM 编码，可用 Excel 打开；CER/DER 数值为比例，例如 `0.12` 表示 12%。
+
+批处理的 `.wav.json` 和完整结果对象均可读；同一录音同时存在 `.wav.json` 和 `.wav.full.json` 时，优先使用前者，避免重复统计。缺少参考、缺少识别结果、重复匹配或无效 JSON 都会写入报告，不会静默跳过。选远场参考目录可避免把近场参考误报为缺少识别结果。
+
+汇总 CER 按参考字符总量加权，DER 按参考说话人总时长加权，均只统计成功配对的文件，并单独列出缺失/失败数量；不是直接平均文件百分比。错误率可能超过 100%；参考文字或说话人时长为零时，对应比率为 `null`/`N/A`，仍保留错误数量和误检时长。有未配对或无效文件时退出码为 1，全部完成对比为 0；错误率大于零本身不导致命令失败。
 
 ## 本地验证
 

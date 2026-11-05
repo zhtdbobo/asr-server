@@ -3,9 +3,11 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from audio import AudioInputError
 from config import Settings
 from gpu_services import GPUEngine, create_gpu_app
 
@@ -64,6 +66,28 @@ def test_gpu_parameter_validation():
         )
         assert response.status_code == 422
         assert engine.calls == []
+
+
+def test_oversized_alignment_text_is_rejected_before_engine_runs():
+    engine = FakeEngine("aligner")
+    with TestClient(create_gpu_app("aligner", engine, Settings())) as client:
+        response = client.post(
+            "/v1/alignment",
+            files={"file": ("a.wav", b"audio")},
+            data={"text": "重复" * 70000, "language": "Chinese"},
+        )
+    assert response.status_code == 422
+    assert engine.calls == []
+
+
+def test_alignment_text_duration_budget_is_checked_before_gpu_inference(monkeypatch):
+    import gpu_services as module
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    monkeypatch.setattr(module, "decode_audio", lambda *_: (np.zeros(16000), 16000))
+    engine = GPUEngine("aligner", Settings())
+    with pytest.raises(AudioInputError, match="上限 256 字符"):
+        engine.run("fake.wav", text="字" * 257, language="Chinese")
 
 
 @pytest.mark.parametrize("kind", ["diarization", "aligner"])

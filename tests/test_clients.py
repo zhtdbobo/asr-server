@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from clients import ServiceClients, UpstreamError
+from clients import ChunkInferenceError, ServiceClients, UpstreamError
 from config import Settings
 
 
@@ -26,6 +26,19 @@ def multipart(request):
     }
 
 
+def stream_event(content="", finish=None):
+    payload = {"choices": [{"delta": {"content": content}, "finish_reason": finish}]}
+    return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode()
+
+
+def asr_response(text, finish="stop"):
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=stream_event(text) + stream_event(finish=finish) + b"data: [DONE]\n\n",
+    )
+
+
 def test_file_upload_api_contract_and_auth():
     def handle(request):
         assert str(request.url) == "http://asr:8000/v1/audio/transcriptions"
@@ -36,8 +49,11 @@ def test_file_upload_api_contract_and_auth():
         assert sr == 16000 and len(audio) == 8000
         assert data["model"][1] == b"Qwen/Qwen3-ASR-1.7B"
         assert data["response_format"][1] == b"json"
-        assert data["stream"][1] == b"false"
-        return httpx.Response(200, json={"text": "language Chinese<asr_text>你好。"})
+        assert data["stream"][1] == b"true"
+        assert data["max_completion_tokens"][1] == b"1024"
+        assert data["temperature"][1] == b"0"
+        assert request.extensions["timeout"]["read"] == 90
+        return asr_response("language Chinese<asr_text>你好。")
 
     settings = Settings(
         asr_api_url="http://asr:8000/v1/audio/transcriptions",
@@ -115,7 +131,7 @@ def test_discover_local_served_model_and_cache():
             assert str(request.url) == "http://asr/prefix/v1/models"
             return httpx.Response(200, json={"data": [{"id": model_id}]})
         assert multipart(request)["model"][1].decode() == model_id
-        return httpx.Response(200, json={"text": "你好"})
+        return asr_response("你好")
 
     client = ServiceClients(
         Settings(asr_api_url="http://asr/prefix/v1/audio/transcriptions", asr_api_key="secret"),
@@ -165,3 +181,207 @@ def test_asr_404_reports_model_url_and_upstream_reason():
         assert all(secret not in message for secret in ("secret", "password", "hidden"))
     finally:
         client.close()
+
+
+def test_asr_timeout_does_not_resubmit_generation_without_logging_secrets(monkeypatch, caplog):
+    import clients as module
+
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+    caplog.set_level("INFO", logger="clients")
+    requests = []
+
+    def timeout(request):
+        requests.append(request)
+        raise httpx.ReadTimeout("secret in transport details", request=request)
+
+    client = ServiceClients(
+        Settings(
+            asr_api_url="http://asr/upload", asr_model="explicit-model", api_timeout_seconds=90
+        ),
+        httpx.MockTransport(timeout),
+    )
+    try:
+        with pytest.raises(UpstreamError, match="未自动重复提交") as caught:
+            client.recognize(np.zeros(10), 16000)
+        assert len(requests) == 1
+        assert "90 秒" in str(caught.value)
+        messages = "\n".join(caplog.messages)
+        assert "ReadTimeout" in messages and "不自动重复提交" in messages
+        assert "secret" not in messages
+    finally:
+        client.close()
+
+
+def test_pathological_alignment_text_is_rejected_before_http_upload():
+    def unexpected_request(request):
+        pytest.fail("异常长文本不应上传到对齐服务")
+
+    client = ServiceClients(Settings(), httpx.MockTransport(unexpected_request))
+    try:
+        with pytest.raises(ChunkInferenceError, match="异常过长"):
+            client.align(np.zeros(16000 * 30), 16000, "重复" * 70000, "Chinese")
+    finally:
+        client.close()
+
+
+class ObservedStream(httpx.SyncByteStream):
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.consumed = 0
+        self.closed = False
+
+    def __iter__(self):
+        for chunk in self.chunks:
+            self.consumed += 1
+            yield chunk
+
+    def close(self):
+        self.closed = True
+
+
+def streaming_client(stream, **settings):
+    return ServiceClients(
+        Settings(asr_api_url="http://asr/upload", asr_model="local-model", **settings),
+        httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=stream
+            )
+        ),
+    )
+
+
+def test_runaway_generation_is_closed_before_remaining_events_are_read():
+    stream = ObservedStream(
+        [stream_event("字" * 300), stream_event("不应读取"), stream_event(finish="stop")]
+    )
+    client = streaming_client(stream)
+    try:
+        with pytest.raises(ChunkInferenceError, match="主动关闭生成流"):
+            client.recognize(np.zeros(16000), 16000)
+    finally:
+        client.close()
+    assert stream.closed and stream.consumed == 1
+
+
+def test_token_limit_is_not_accepted_as_a_complete_transcript():
+    stream = ObservedStream([stream_event("只有一半"), stream_event(finish="length")])
+    client = streaming_client(stream)
+    try:
+        with pytest.raises(ChunkInferenceError, match="正文被截断"):
+            client.recognize(np.zeros(16000), 16000)
+    finally:
+        client.close()
+    assert stream.closed
+
+
+@pytest.mark.parametrize("done", [b"", b"data: [DONE]\n\n"])
+def test_partial_stream_without_normal_finish_is_rejected(done):
+    stream = ObservedStream([stream_event("不完整"), done])
+    client = streaming_client(stream)
+    try:
+        with pytest.raises(UpstreamError, match="未收到正常结束标记"):
+            client.recognize(np.zeros(16000), 16000)
+    finally:
+        client.close()
+
+
+def test_stream_parser_handles_unicode_network_boundaries_comments_and_multiline_data():
+    event = json.dumps(
+        {"choices": [{"delta": {"content": "你好"}, "finish_reason": None}]}, ensure_ascii=False
+    )
+    event = event.replace("[{", "[\n{", 1)
+    multiline = "\n".join("data: " + line for line in event.splitlines()) + "\n\n"
+    wire = b": heartbeat\n\n" + multiline.encode() + stream_event(finish="stop")
+    wire += b'data: {"choices": [], "usage": {"completion_tokens": 2}}\n\n'
+    wire += b"data: [DONE]\n\n"
+    stream = ObservedStream([wire[i : i + 1] for i in range(len(wire))])
+    client = streaming_client(stream)
+    try:
+        assert client.recognize(np.zeros(16000), 16000) == "你好"
+    finally:
+        client.close()
+    assert stream.closed
+
+
+def test_active_generation_and_heartbeat_obey_elapsed_time_budget(monkeypatch):
+    import clients as module
+
+    clock = [0.0]
+    monkeypatch.setattr(module.time, "perf_counter", lambda: clock[0])
+
+    def chunks():
+        yield stream_event("前半句")
+        clock[0] = 91
+        yield b": keepalive\n\n"
+        yield stream_event(finish="stop")
+
+    stream = ObservedStream(chunks())
+    client = streaming_client(stream)
+    try:
+        with pytest.raises(UpstreamError, match="生成耗时超过 90 秒"):
+            client.recognize(np.zeros(16000), 16000)
+    finally:
+        client.close()
+    assert stream.closed and stream.consumed == 2
+
+
+def test_stream_error_does_not_expose_api_key():
+    payload = b'data: {"error": {"message": "failed secret"}}\n\n'
+    stream = ObservedStream([payload])
+    client = streaming_client(stream, asr_api_key="secret")
+    try:
+        with pytest.raises(UpstreamError, match="流式错误") as caught:
+            client.recognize(np.zeros(16000), 16000)
+        assert "secret" not in str(caught.value)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "wire", [b"data: invalid-json\n\n", b"data: []\n\n", b'data: {"choices": []}\n\n']
+)
+def test_invalid_stream_is_not_silently_treated_as_empty_speech(wire):
+    client = streaming_client(ObservedStream([wire]))
+    try:
+        with pytest.raises(UpstreamError):
+            client.recognize(np.zeros(16000), 16000)
+    finally:
+        client.close()
+
+
+def test_openai_transcript_delta_and_done_events():
+    wire = b'data: {"type": "transcript.text.delta", "delta": "Hello"}\n\n'
+    wire += b'data: {"type": "transcript.text.done", "text": "Hello!"}\n\n'
+    client = streaming_client(ObservedStream([wire]))
+    try:
+        assert client.recognize(np.zeros(16000), 16000) == "Hello!"
+    finally:
+        client.close()
+
+
+def test_asr_generation_limit_and_timeout_can_be_overridden():
+    def handle(request):
+        assert multipart(request)["max_completion_tokens"][1] == b"512"
+        assert request.extensions["timeout"]["read"] == 30
+        return asr_response("你好")
+
+    client = ServiceClients(
+        Settings(
+            asr_api_url="http://asr/upload",
+            asr_model="local-model",
+            asr_max_completion_tokens=512,
+            asr_timeout_seconds=60,
+            api_timeout_seconds=30,
+        ),
+        httpx.MockTransport(handle),
+    )
+    try:
+        assert client.recognize(np.zeros(16000), 16000) == "你好"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_invalid_asr_token_limits_are_rejected(value):
+    with pytest.raises(ValueError, match="正整数"):
+        Settings(asr_max_completion_tokens=value)

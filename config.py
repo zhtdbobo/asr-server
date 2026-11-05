@@ -13,6 +13,8 @@ class Settings:
     internal_api_key: str = field(default="", repr=False)
     service_api_key: str = field(default="", repr=False)
     api_timeout_seconds: float = 600
+    asr_timeout_seconds: float = 90
+    asr_max_completion_tokens: int = 1024
     asr_chunk_seconds: float = 30
     aligner_model: str = "/models/Qwen3-ForcedAligner-0.6B"
     diarization_model: str = "/models/speaker-diarization-community-1"
@@ -32,12 +34,23 @@ class Settings:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} 必须是大于等于 0 的有限数字")
-        for name in ("max_audio_seconds", "api_timeout_seconds", "asr_chunk_seconds"):
+        for name in (
+            "max_audio_seconds",
+            "api_timeout_seconds",
+            "asr_timeout_seconds",
+            "asr_chunk_seconds",
+        ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} 必须大于 0")
         if self.asr_chunk_seconds > 180:
             raise ValueError("asr_chunk_seconds 不能超过对齐模型的 180 秒分块上限")
+        if (
+            isinstance(self.asr_max_completion_tokens, bool)
+            or not isinstance(self.asr_max_completion_tokens, int)
+            or self.asr_max_completion_tokens <= 0
+        ):
+            raise ValueError("asr_max_completion_tokens 必须为正整数")
         for name in ("max_upload_mb", "gpu_pending_requests", "job_workers", "max_pending_jobs"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} 必须大于 0")

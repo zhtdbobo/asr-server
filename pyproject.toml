@@ -24,9 +24,11 @@ test = ["pytest>=8,<10", "ruff>=0.11,<1"]
 [project.scripts]
 meeting-asr = "transcribe:main"
 meeting-asr-batch = "batch_transcribe:main"
+meeting-textgrid-json = "textgrid_to_json:main"
+meeting-asr-compare = "compare_transcripts:main"
 
 [tool.setuptools]
-py-modules = ["app", "transcribe", "batch_transcribe", "pipeline", "audio", "alignment", "config", "clients", "gpu_services", "jobs", "offline_docs"]
+py-modules = ["app", "transcribe", "batch_transcribe", "textgrid_to_json", "compare_transcripts", "pipeline", "audio", "alignment", "config", "clients", "gpu_services", "jobs", "offline_docs"]
 packages = ["swagger_assets"]
 
 [tool.setuptools.package-data]

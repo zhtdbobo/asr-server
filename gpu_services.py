@@ -12,6 +12,7 @@ from typing import Annotated
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
 from audio import AudioInputError, decode_audio
+from clients import MAX_ALIGNMENT_TEXT_CHARS, alignment_text_limit
 from config import Settings
 from offline_docs import install_offline_docs
 from pipeline import validate_options
@@ -92,6 +93,16 @@ class GPUEngine:
 
         limit = self.settings.max_audio_seconds if self.kind == "diarization" else 180
         waveform, sr = decode_audio(path, limit)
+        if self.kind == "aligner":
+            text_limit = alignment_text_limit(len(waveform) / sr)
+            if len(options["text"]) > text_limit:
+                raise AudioInputError(
+                    f"对齐文本异常过长：{len(options['text'])} 字符；"
+                    f"当前音频块上限 {text_limit} 字符，请缩短音频并重新识别"
+                )
+            logger.info(
+                "对齐输入：音频 %.3f 秒，文本 %d 字符", len(waveform) / sr, len(options["text"])
+            )
         with self.lock, torch.inference_mode():
             if self.kind == "diarization":
                 result = self.model(
@@ -176,7 +187,7 @@ def create_gpu_app(kind: str, engine=None, settings=None):
         @app.post("/v1/alignment")
         def align(
             file: Annotated[UploadFile, File()],
-            text: Annotated[str, Form(min_length=1)],
+            text: Annotated[str, Form(min_length=1, max_length=MAX_ALIGNMENT_TEXT_CHARS)],
             authorization: Annotated[str | None, Header()] = None,
             language: Annotated[str, Form()] = "Chinese",
         ):
