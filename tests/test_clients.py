@@ -221,6 +221,53 @@ class ObservedStream(httpx.SyncByteStream):
         self.closed = True
 
 
+def test_diarization_logs_headers_before_body_and_json_without_trace_secrets(tmp_path, caplog):
+    caplog.set_level("INFO", logger="clients")
+    path = tmp_path / "audio.wav"
+    path.write_bytes(b"audio")
+
+    class DelayedBody(httpx.SyncByteStream):
+        def __iter__(self):
+            assert "收到响应头，HTTP 200" in caplog.text
+            assert "JSON 解析完成" not in caplog.text
+            yield b'{"turns": []}'
+
+    def handle(request):
+        request.extensions["trace"](
+            "http11.send_request_body.complete", {"headers": {"Authorization": "Bearer private"}}
+        )
+        return httpx.Response(200, stream=DelayedBody())
+
+    client = ServiceClients(Settings(internal_api_key="private"), httpx.MockTransport(handle))
+    try:
+        assert client.diarize(path, {}) == []
+    finally:
+        client.close()
+    text = caplog.text
+    assert text.index("请求体发送完成") < text.index("收到响应头，HTTP 200")
+    assert text.index("收到响应头，HTTP 200") < text.index("响应正文已收完")
+    assert text.index("响应正文已收完") < text.index("JSON 解析完成")
+    assert "结果读取完成，共 0 个说话人时间段" in text
+    assert "private" not in text
+
+
+def test_asr_logs_first_event_before_the_stream_finishes(caplog):
+    caplog.set_level("INFO", logger="clients")
+
+    def chunks():
+        yield stream_event("你好")
+        assert "收到首条 SSE 数据" in caplog.text
+        assert "流式正文读取完成" not in caplog.text
+        yield stream_event(finish="stop")
+
+    client = streaming_client(ObservedStream(chunks()))
+    try:
+        assert client.recognize(np.zeros(16000), 16000) == "你好"
+    finally:
+        client.close()
+    assert "流式正文读取完成" in caplog.text
+
+
 def streaming_client(stream, **settings):
     return ServiceClients(
         Settings(asr_api_url="http://asr/upload", asr_model="local-model", **settings),

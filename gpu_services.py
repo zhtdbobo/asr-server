@@ -7,6 +7,7 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
+from time import perf_counter
 from typing import Annotated
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -75,8 +76,23 @@ class GPUEngine:
     def run(self, path, **options):
         import torch
 
+        started = perf_counter()
+        logger.info("Community-1 开始解码已上传的音频")
         waveform, sr = decode_audio(path, self.settings.max_audio_seconds)
+        duration = len(waveform) / sr
+        logger.info(
+            "Community-1 解码完成，音频 %.3f 秒，解码耗时 %.3f 秒；等待 GPU 推理锁",
+            duration,
+            perf_counter() - started,
+        )
+        waiting = perf_counter()
         with self.lock, torch.inference_mode():
+            inference_started = perf_counter()
+            logger.info(
+                "Community-1 开始模型推理，设备 %s，等待锁 %.3f 秒",
+                self.settings.diarization_device,
+                inference_started - waiting,
+            )
             result = self.model(
                 {"waveform": torch.from_numpy(waveform).unsqueeze(0), "sample_rate": sr},
                 **options,
@@ -84,12 +100,17 @@ class GPUEngine:
             exclusive = getattr(result, "exclusive_speaker_diarization", None)
             if exclusive is None:
                 raise RuntimeError("模型未返回 exclusive_speaker_diarization，请使用 Community-1")
-            return {
-                "turns": [
-                    {"start": float(t.start), "end": float(t.end), "speaker": str(label)}
-                    for t, _, label in exclusive.itertracks(yield_label=True)
-                ]
-            }
+            turns = [
+                {"start": float(t.start), "end": float(t.end), "speaker": str(label)}
+                for t, _, label in exclusive.itertracks(yield_label=True)
+            ]
+            logger.info(
+                "Community-1 模型推理完成，耗时 %.3f 秒，音频 %.3f 秒，共 %d 个时间段",
+                perf_counter() - inference_started,
+                duration,
+                len(turns),
+            )
+            return {"turns": turns}
 
 
 def create_gpu_app(engine=None, settings=None):

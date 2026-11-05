@@ -62,10 +62,48 @@ class ServiceClients:
             limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
             trust_env=False,
             transport=transport,
+            event_hooks={"response": [self._log_response_headers]},
         )
 
     def close(self):
         self.http.close()
+
+    @staticmethod
+    def _request_extensions(service, started):
+        # Log only phase names, never trace metadata (headers may contain API keys).
+        def trace(event, _info):
+            phases = {
+                "send_request_body.started": "开始发送请求体",
+                "send_request_body.complete": "请求体发送完成，等待服务响应",
+                "receive_response_body.started": "开始接收响应正文",
+                "receive_response_body.complete": "响应正文传输结束",
+            }
+            phase = phases.get(event.partition(".")[2])
+            if phase:
+                logger.info(
+                    "%s %s，累计耗时 %.1f 秒", service, phase, time.perf_counter() - started
+                )
+
+        return {"meeting_service": service, "meeting_started": started, "trace": trace}
+
+    @staticmethod
+    def _log_response_headers(response):
+        extensions = response.request.extensions
+        service = extensions.get("meeting_service")
+        if not service:
+            return
+        body_kind = (
+            "流式正文"
+            if "text/event-stream" in response.headers.get("content-type", "")
+            else "正文"
+        )
+        logger.info(
+            "%s 收到响应头，HTTP %d，耗时 %.1f 秒；即将读取%s，尚不代表接收完成",
+            service,
+            response.status_code,
+            time.perf_counter() - extensions["meeting_started"],
+            body_kind,
+        )
 
     def _safe_detail(self, detail):
         detail = str(detail).replace("\n", " ").replace("\r", " ")
@@ -75,6 +113,10 @@ class ServiceClients:
         return detail[:500]
 
     def _response_json(self, response, service, url, model=""):
+        started = time.perf_counter()
+        logger.info(
+            "%s 响应正文已收完，%.1f KB；开始解析 JSON", service, len(response.content) / 1024
+        )
         parts = urlsplit(url)
         safe_url = urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, "", ""))
         target = f"{service}（{safe_url}" + (f"；model={model}" if model else "") + "）"
@@ -97,6 +139,7 @@ class ServiceClients:
             raise UpstreamError(f"{target} 没有返回 JSON") from exc
         if not isinstance(body, dict):
             raise UpstreamError(f"{target} JSON 格式无效")
+        logger.info("%s JSON 解析完成，耗时 %.3f 秒", service, time.perf_counter() - started)
         return body
 
     def _model_name(self):
@@ -126,9 +169,12 @@ class ServiceClients:
                 else {}
             )
             try:
+                started = time.perf_counter()
+                logger.info("Qwen3-ASR 开始查询 /v1/models 的模型 ID")
                 response = self.http.get(
                     models_url,
                     headers=headers,
+                    extensions=self._request_extensions("Qwen3-ASR 模型列表", started),
                     timeout=httpx.Timeout(
                         min(self.settings.api_timeout_seconds, self.settings.asr_timeout_seconds),
                         connect=min(
@@ -175,8 +221,17 @@ class ServiceClients:
             try:
                 if isinstance(source, Path):
                     with source.open("rb") as audio:
+                        logger.info(
+                            "%s 上传文件 %.1f MB，等待响应头",
+                            service,
+                            source.stat().st_size / 1024**2,
+                        )
                         response = self.http.post(
-                            url, data=data, files={"file": ("audio.wav", audio)}, headers=headers
+                            url,
+                            data=data,
+                            files={"file": ("audio.wav", audio)},
+                            headers=headers,
+                            extensions=self._request_extensions(service, started),
                         )
                 else:
                     response = self.http.post(
@@ -184,6 +239,7 @@ class ServiceClients:
                         data=data,
                         files={"file": ("audio.wav", source, "audio/wav")},
                         headers=headers,
+                        extensions=self._request_extensions(service, started),
                     )
             except httpx.TransportError as exc:
                 logger.warning(
@@ -237,9 +293,16 @@ class ServiceClients:
         pieces = []
         finished = False
         limit = asr_text_limit(duration)
+        events = 0
+        last_progress = started
         for data in sse_data(checked_lines()):
             if data.strip() == "[DONE]":
                 break
+            events += 1
+            if events == 1:
+                logger.info(
+                    "Qwen3-ASR 收到首条 SSE 数据，耗时 %.1f 秒", time.perf_counter() - started
+                )
             try:
                 event = json.loads(data)
             except ValueError as exc:
@@ -289,19 +352,34 @@ class ServiceClients:
                     raise UpstreamError("Qwen3-ASR 流式正文不是字符串")
                 pieces.append(content)
             text = self._asr_text("".join(pieces))
+            now = time.perf_counter()
+            if now - last_progress >= 15:
+                logger.info(
+                    "Qwen3-ASR 正在读取生成流，已接收 %d 个事件、%d 字符，耗时 %.1f 秒",
+                    events,
+                    len(text),
+                    now - started,
+                )
+                last_progress = now
             if len(text) > limit:
                 raise ChunkInferenceError(
                     f"ASR 文本异常过长：超过本块 {limit} 字符，已主动关闭生成流"
                 )
         if not finished:
             raise UpstreamError("Qwen3-ASR 流式响应提前结束，未收到正常结束标记；未使用不完整正文")
-        return self._asr_text("".join(pieces))
+        text = self._asr_text("".join(pieces))
+        logger.info("Qwen3-ASR 流式正文读取完成，%d 个事件、%d 字符", events, len(text))
+        return text
 
     def recognize(self, waveform, sample_rate: int) -> str:
         url = self.settings.asr_api_url
         if not url.startswith(("http://", "https://")):
             raise UpstreamError("请配置完整的 ASR_API_URL")
+        logger.info("Qwen3-ASR 准备转写 %.3f 秒音频，正在确定模型 ID", len(waveform) / sample_rate)
         model = self._model_name()
+        logger.info("Qwen3-ASR 开始编码上传 WAV")
+        payload = wav_bytes(waveform, sample_rate)
+        logger.info("Qwen3-ASR WAV 编码完成，%.1f KB", len(payload) / 1024)
         timeout_seconds = min(self.settings.api_timeout_seconds, self.settings.asr_timeout_seconds)
         headers = {"Accept": "text/event-stream"}
         if self.settings.asr_api_key:
@@ -324,8 +402,9 @@ class ServiceClients:
                 "POST",
                 url,
                 data=data,
-                files={"file": ("audio.wav", wav_bytes(waveform, sample_rate), "audio/wav")},
+                files={"file": ("audio.wav", payload, "audio/wav")},
                 headers=headers,
+                extensions=self._request_extensions("Qwen3-ASR", started),
                 timeout=httpx.Timeout(timeout_seconds, connect=min(15, timeout_seconds)),
             ) as response:
                 if response.is_error:
@@ -363,4 +442,5 @@ class ServiceClients:
         )
         if not isinstance(body.get("turns"), list):
             raise UpstreamError("说话人服务响应缺少 turns 数组")
+        logger.info("Community-1 结果读取完成，共 %d 个说话人时间段", len(body["turns"]))
         return body["turns"]

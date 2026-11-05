@@ -1,4 +1,4 @@
-"""Transcribe a local audio folder using the three remote inference services."""
+"""Transcribe a local audio folder using remote diarization and ASR services."""
 
 import argparse
 import json
@@ -6,13 +6,17 @@ import logging
 import math
 import sys
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
+from traceback import format_exception
 from uuid import uuid4
 
 from config import Settings
 from pipeline import MeetingPipeline, validate_options
+
+logger = logging.getLogger(__name__)
 
 AUDIO_EXTENSIONS = {
     ".wav",
@@ -30,6 +34,32 @@ AUDIO_EXTENSIONS = {
     ".caf",
     ".mka",
 }
+
+
+@contextmanager
+def batch_logging(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(path, encoding="utf-8")
+    root = logging.getLogger()
+    previous_level = root.level
+    # In CLI use, write to disk before the console, which may be paused by selection.
+    handlers = [file_handler]
+    if not root.handlers:
+        handlers.append(logging.StreamHandler())
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s"
+    )
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    try:
+        yield
+    finally:
+        for handler in handlers:
+            root.removeHandler(handler)
+            handler.close()
+        root.setLevel(previous_level)
 
 
 def comparison_segments(result: dict | list) -> list[dict]:
@@ -116,9 +146,8 @@ def run_batch(
         raise ValueError("文件夹中没有支持的音频文件；如音频在子目录，请加 --recursive")
     options = options or {}
     started = perf_counter()
-    print(
+    logger.info(
         f"找到 {len(files)} 个音频，最多同时处理 {workers} 个；JSON 用于对比，TXT 用于阅读。",
-        flush=True,
     )
 
     def process(path):
@@ -138,7 +167,7 @@ def run_batch(
                     existing = json.loads(json_path.read_text(encoding="utf-8-sig"))
                     segments = comparison_segments(existing)
                 except (ValueError, TypeError, OSError) as exc:
-                    print(f"[重新处理] {relative}: 已有 JSON 无效（{exc}）", flush=True)
+                    logger.warning("[重新处理] %s: 已有 JSON 无效（%s）", relative, exc)
                 else:
                     # Migrate the old full-result JSON without repeating GPU inference.
                     updates = {}
@@ -155,9 +184,10 @@ def run_batch(
                     if full_json_path.is_file():
                         item["full_json_file"] = str(full_json_path)
                     return {**item, "status": "skipped", "json_updated": bool(updates)}
-            print(f"[开始] {relative}", flush=True)
+            logger.info("[开始] %s", relative)
             result = pipeline.transcribe(path, **options)
             segments = comparison_segments(result)
+            logger.info("[%s] 开始写入 TXT、对比 JSON 和完整 JSON", relative)
             write_outputs(
                 {
                     text_path: result["formatted_text"] + "\n",
@@ -165,13 +195,17 @@ def run_batch(
                     full_json_path: json.dumps(result, ensure_ascii=False, indent=2) + "\n",
                 }
             )
+            logger.info("[%s] 三份结果文件写入完成", relative)
             return {**item, "full_json_file": str(full_json_path), "status": "completed"}
         except Exception as exc:  # noqa: BLE001 - A failed input must not abort other files.
+            # Upstream errors redact secrets; don't print their raw transport causes.
+            details = "".join(format_exception(type(exc), exc, exc.__traceback__, chain=False))
+            logger.error("[%s] 处理失败\n%s", relative, details.rstrip())
             return {**item, "status": "failed", "error": str(exc)}
 
     results = []
     labels = {"completed": "成功", "failed": "失败", "skipped": "跳过"}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="asr-file") as pool:
         pending = {pool.submit(process, path): path for path in files}
         while pending:
             done, _ = wait(pending, timeout=15, return_when=FIRST_COMPLETED)
@@ -181,12 +215,11 @@ def run_batch(
                     for future, path in pending.items()
                     if future.running()
                 ]
-                print(
+                logger.info(
                     f"[等待] 已结束 {len(results)}/{len(files)} 个，"
                     f"本批次已耗时 {perf_counter() - started:.0f} 秒；"
                     f"正在处理: {', '.join(running) or '等待工作线程'}；"
                     "当前阶段见上方处理日志。",
-                    flush=True,
                 )
             for future in done:
                 pending.pop(future)
@@ -195,9 +228,8 @@ def run_batch(
                 suffix = f"：{item['error']}" if item["status"] == "failed" else ""
                 if item.get("json_updated"):
                     suffix += "（已有 JSON 已统一为对比格式）"
-                print(
+                logger.info(
                     f"[{len(results)}/{len(files)}] {labels[item['status']]} {item['file']}{suffix}",
-                    flush=True,
                 )
 
     report = {
@@ -223,6 +255,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="批量处理本地文件夹中的音频，生成发言人和时间戳")
     parser.add_argument("folder", type=Path, help="云桌面上的音频文件夹")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/batch"))
+    parser.add_argument(
+        "--log-file", type=Path, help="日志文件，默认输出目录下的 batch.log（追加）"
+    )
     parser.add_argument("--recursive", action="store_true", help="同时处理子文件夹")
     parser.add_argument("--workers", type=int, default=1, help="同时处理文件数，默认 1")
     parser.add_argument(
@@ -238,7 +273,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers 必须大于 0")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log_path = (args.log_file or args.output_dir / "batch.log").resolve()
+    try:
+        with batch_logging(log_path):
+            logger.info("批处理日志文件：%s", log_path)
+            logger.info("Python：%s；版本：%s", sys.executable, sys.version.split()[0])
+            return run_cli(args, parser)
+    except OSError as exc:
+        parser.exit(1, f"日志或输出文件无法写入: {exc}\n")
+
+
+def run_cli(args, parser):
     pipeline = None
     try:
         language, counts = validate_options(
@@ -249,6 +294,14 @@ def main(argv=None):
             settings = replace(settings, api_timeout_seconds=args.timeout_seconds)
         if not settings.asr_api_url:
             raise ValueError("请先在 .env 中配置 ASR_API_URL")
+        logger.info(
+            "本次配置：%d 个文件并发，ASR 子块上限 %.1f 秒，ASR 等待上限 %.1f 秒，"
+            "说话人读写等待上限 %.1f 秒",
+            settings.job_workers,
+            settings.asr_chunk_seconds,
+            min(settings.api_timeout_seconds, settings.asr_timeout_seconds),
+            settings.api_timeout_seconds,
+        )
         pipeline = MeetingPipeline(settings)
         report = run_batch(
             args.folder,
@@ -260,11 +313,12 @@ def main(argv=None):
             options={"language": language, **counts},
         )
     except (ValueError, RuntimeError, OSError) as exc:
+        logger.error("批处理退出（%s）：%s", type(exc).__name__, exc)
         parser.exit(1, f"批处理失败: {exc}\n")
     finally:
         if pipeline is not None:
             pipeline.close()
-    print(
+    logger.info(
         f"\n处理结束：共 {report['total']} 个，成功 {report['completed']} 个，"
         f"失败 {report['failed']} 个，跳过 {report['skipped']} 个。\n"
         f"汇总：{args.output_dir.resolve() / 'batch-summary.json'}"

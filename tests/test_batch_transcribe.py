@@ -1,10 +1,12 @@
 import json
+import logging
 from pathlib import Path
 from threading import Barrier, Lock
 
 import pytest
 
 import batch_transcribe as batch
+from clients import UpstreamError
 from config import Settings
 
 
@@ -142,6 +144,58 @@ def test_cli_failure_exit_and_closes_client(tmp_path, monkeypatch):
         == 1
     )
     assert pipeline.closed
+    log = (tmp_path / "out" / "batch.log").read_text(encoding="utf-8")
+    assert "Python：" in log and "本次配置：" in log
+    assert "[asr-file_0]" in log or "[asr-file_1]" in log
+    assert "ASR unavailable" in log and "Traceback" in log
+    assert "处理结束" in log
+
+
+def test_custom_log_file_captures_worker_messages_and_restores_logging(tmp_path, monkeypatch):
+    audio(tmp_path / "audio", "meeting.wav")
+    previous_level = logging.getLogger().level
+    handlers = list(logging.getLogger().handlers)
+    monkeypatch.setattr(
+        batch.Settings, "from_env", lambda: Settings(asr_api_url="http://asr/upload")
+    )
+    monkeypatch.setattr(batch, "MeetingPipeline", lambda _: FakePipeline())
+    log_file = tmp_path / "logs" / "diagnostic.log"
+    assert (
+        batch.main(
+            [
+                str(tmp_path / "audio"),
+                "--output-dir",
+                str(tmp_path / "out"),
+                "--log-file",
+                str(log_file),
+            ]
+        )
+        == 0
+    )
+    log = log_file.read_text(encoding="utf-8")
+    assert "[开始] meeting.wav" in log and "三份结果文件写入完成" in log
+    assert not (tmp_path / "out" / "batch.log").exists()
+    assert logging.getLogger().level == previous_level
+    assert logging.getLogger().handlers == handlers
+
+
+def test_failure_logging_preserves_redacted_error_without_private_transport_cause(tmp_path):
+    audio(tmp_path / "audio", "meeting.wav")
+
+    class FailedPipeline:
+        def transcribe(self, *_args, **_kwargs):
+            try:
+                raise RuntimeError("private-transport-secret")
+            except RuntimeError as exc:
+                raise UpstreamError("服务读取失败，已隐藏敏感信息") from exc
+
+    log_path = tmp_path / "batch.log"
+    with batch.batch_logging(log_path):
+        report = batch.run_batch(tmp_path / "audio", tmp_path / "out", FailedPipeline())
+    log = log_path.read_text(encoding="utf-8")
+    assert report["failed"] == 1
+    assert "服务读取失败" in log and "Traceback" in log
+    assert "private-transport-secret" not in log
 
 
 def test_invalid_or_empty_folder_does_not_call_services(tmp_path):
@@ -207,7 +261,8 @@ def test_resume_reprocesses_invalid_cached_json(tmp_path):
     assert pipeline.calls == [(path, {})]
 
 
-def test_waiting_progress_is_visible_before_any_file_finishes(tmp_path, monkeypatch, capsys):
+def test_waiting_progress_is_visible_before_any_file_finishes(tmp_path, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="batch_transcribe")
     audio(tmp_path / "audio", "meeting.wav")
     actual_wait = batch.wait
     calls = []
@@ -220,5 +275,5 @@ def test_waiting_progress_is_visible_before_any_file_finishes(tmp_path, monkeypa
 
     monkeypatch.setattr(batch, "wait", first_wait_times_out)
     assert batch.run_batch(tmp_path / "audio", tmp_path / "out", FakePipeline())["completed"] == 1
-    assert "[等待]" in capsys.readouterr().out
+    assert "[等待]" in caplog.text
     assert calls[0] == 15

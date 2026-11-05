@@ -166,6 +166,7 @@ class MeetingPipeline:
                 # the original 8-channel WAV can exceed the GPU upload limit.
                 with tempfile.TemporaryDirectory(prefix="meeting-diarization-") as directory:
                     mono_path = Path(directory) / "mono-16k.wav"
+                    logger.info("[%s] 开始写入整段单声道 PCM16 临时 WAV", name)
                     sf.write(mono_path, waveform, sample_rate, subtype="PCM_16")
                     logger.info(
                         "[%s] 上传整段 16 kHz 单声道 PCM16，共 %.1f MB",
@@ -176,6 +177,10 @@ class MeetingPipeline:
                         Turn(float(t["start"]), float(t["end"]), t["speaker"])
                         for t in self.clients.diarize(mono_path, speaker_options)
                     ]
+                    logger.info(
+                        "[%s] 说话人响应已转换，共 %d 段；开始清理临时 WAV", name, len(turns)
+                    )
+                logger.info("[%s] 临时 WAV 清理完成；开始校验说话人时间段", name)
                 if any(not isinstance(t.speaker, str) for t in turns):
                     raise ValueError("说话人 ID 必须为字符串")
                 turns = validate_turns(turns, total_seconds)
@@ -220,6 +225,7 @@ class MeetingPipeline:
             )
             output["processing_seconds"] = round(perf_counter() - started, 3)
             output["warnings"].extend(retry_warnings)
+            logger.info("[%s] 转写结果组装完成，共 %d 条警告", name, len(output["warnings"]))
             if not turns:
                 output["warnings"].append("未检测到有效语音。")
             logger.info(

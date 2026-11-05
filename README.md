@@ -254,6 +254,34 @@ python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --recursiv
 
 终端会显示当前文件、音频时长、分块时间范围、说话人分段和逐段 ASR 阶段，以及请求开始、耗时和重试次数。如果 15 秒内没有文件完成，会打印当前处理的文件与本批次耗时。HTTP 200 只代表该次请求成功，不能据此判断整段录音已经处理完；同一录音还可能继续请求后续分块。
 
+批处理默认把同样的日志追加写入输出目录下的 `batch.log`，包含线程名、Python 路径、配置摘要和失败位置。也可指定独立日志文件：
+
+```bash
+uv run --no-sync python batch_transcribe.py "D:/录音" --output-dir "outputs/transcribe" --log-file "outputs/transcribe/debug.log"
+```
+
+排查“服务器已返回 200，但客户端没有进入 ASR”时，依次查看以下阶段；网络传输日志由 HTTP 客户端产生，`收到响应头` 与 `正文已收完` 分开记录：
+
+```text
+Community-1 请求体发送完成，等待服务响应
+Community-1 收到响应头，HTTP 200；即将读取正文，尚不代表接收完成
+Community-1 响应正文已收完；开始解析 JSON
+Community-1 JSON 解析完成
+Community-1 结果读取完成，共 ... 个说话人时间段
+说话人响应已转换；开始清理临时 WAV
+临时 WAV 清理完成；开始校验说话人时间段
+说话人片段 ... 开始 ASR
+Qwen3-ASR 收到响应头，HTTP 200；即将读取流式正文
+Qwen3-ASR 收到首条 SSE 数据
+Qwen3-ASR 流式正文读取完成
+```
+
+ASR 在收到流式事件时每隔约 15 秒记录一次事件数、字符数和耗时；无新事件时不会伪造接收进度，批处理仍会打印等待信息。阶段日志不打印识别正文、鉴权头或网络跟踪元数据。
+
+当前 Community-1 接口先完成整段模型推理，再返回 JSON，因此对应的 `POST /v1/diarization` 出现 200 通常表示推理已经返回，但客户端是否读完正文、清理完临时文件仍要看后续日志。新版 GPU 服务还会分别记录解码耗时、等待推理锁的时间和实际模型推理耗时；需要同步 `gpu_services.py` 并重建、导入 GPU 镜像后才能看到这些服务端日志。仅增加云桌面日志时，更新 `clients.py`、`pipeline.py`、`batch_transcribe.py` 并重启批处理即可，不要求重建 GPU 镜像。
+
+如果 Windows 传统控制台连每 15 秒的等待日志也停止，且按键后立刻恢复，先按 `Esc` 退出文本选择，再到窗口标题栏的“属性 → 选项”关闭“快速编辑模式”。控制台选择可能阻塞输出，不能仅凭截图认定是网络或 GPU 问题；参见 [Microsoft 控制台问题说明](https://github.com/microsoft/terminal/issues/2678)。不要把反复按 `Ctrl+C` 当作继续执行，因为它也可能触发程序中断。
+
 Community-1 的读写等待超时由 `.env` 的 `API_TIMEOUT_SECONDS` 控制，默认 600 秒，连接异常或部分临时 HTTP 错误最多尝试 3 次。可以在本次批处理中覆盖公共超时，例如：
 
 ```bash
