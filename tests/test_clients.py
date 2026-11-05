@@ -80,21 +80,15 @@ def test_internal_service_payloads_and_reopened_retry(tmp_path, monkeypatch):
         data = multipart(request)
         calls.append(data)
         assert request.headers["authorization"] == "Bearer internal"
-        if request.url.path == "/v1/diarization":
-            assert data["file"][1] == b"original-content"
-            assert data["num_speakers"][1] == b"3"
-            return (
-                httpx.Response(503) if len(calls) == 1 else httpx.Response(200, json={"turns": []})
-            )
-        assert data["text"][1].decode() == "你好"
-        assert data["language"][1] == b"Chinese"
-        return httpx.Response(200, json={"words": []})
+        assert request.url.path == "/v1/diarization"
+        assert data["file"][1] == b"original-content"
+        assert data["num_speakers"][1] == b"3"
+        return httpx.Response(503) if len(calls) == 1 else httpx.Response(200, json={"turns": []})
 
     client = ServiceClients(Settings(internal_api_key="internal"), httpx.MockTransport(handle))
     try:
         assert client.diarize(path, {"num_speakers": 3}) == []
-        assert client.align(np.zeros(8000), 16000, "你好", "Chinese") == []
-        assert len(calls) == 3
+        assert len(calls) == 2
     finally:
         client.close()
 
@@ -208,18 +202,6 @@ def test_asr_timeout_does_not_resubmit_generation_without_logging_secrets(monkey
         messages = "\n".join(caplog.messages)
         assert "ReadTimeout" in messages and "不自动重复提交" in messages
         assert "secret" not in messages
-    finally:
-        client.close()
-
-
-def test_pathological_alignment_text_is_rejected_before_http_upload():
-    def unexpected_request(request):
-        pytest.fail("异常长文本不应上传到对齐服务")
-
-    client = ServiceClients(Settings(), httpx.MockTransport(unexpected_request))
-    try:
-        with pytest.raises(ChunkInferenceError, match="异常过长"):
-            client.align(np.zeros(16000 * 30), 16000, "重复" * 70000, "Chinese")
     finally:
         client.close()
 

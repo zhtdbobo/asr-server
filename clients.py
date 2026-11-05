@@ -1,4 +1,4 @@
-"""HTTP clients for the existing Qwen API and the two independent GPU services."""
+"""HTTP clients for the existing Qwen API and Community-1 diarization service."""
 
 import io
 import json
@@ -14,7 +14,7 @@ import httpx
 from config import Settings
 
 logger = logging.getLogger(__name__)
-MAX_ALIGNMENT_TEXT_CHARS = 4096
+MAX_ASR_TEXT_CHARS = 4096
 
 
 class UpstreamError(RuntimeError):
@@ -25,9 +25,9 @@ class ChunkInferenceError(UpstreamError):
     """Model output that can be retried by re-recognizing shorter audio."""
 
 
-def alignment_text_limit(duration: float) -> int:
+def asr_text_limit(duration: float) -> int:
     """A conservative character budget, well above ordinary speech density."""
-    return min(MAX_ALIGNMENT_TEXT_CHARS, max(256, math.ceil(duration * 40)))
+    return min(MAX_ASR_TEXT_CHARS, max(256, math.ceil(duration * 40)))
 
 
 def sse_data(lines):
@@ -236,7 +236,7 @@ class ServiceClients:
 
         pieces = []
         finished = False
-        limit = alignment_text_limit(duration)
+        limit = asr_text_limit(duration)
         for data in sse_data(checked_lines()):
             if data.strip() == "[DONE]":
                 break
@@ -291,7 +291,7 @@ class ServiceClients:
             text = self._asr_text("".join(pieces))
             if len(text) > limit:
                 raise ChunkInferenceError(
-                    f"ASR 文本异常过长：超过本块 {limit} 字符，已主动关闭生成流，未送去对齐"
+                    f"ASR 文本异常过长：超过本块 {limit} 字符，已主动关闭生成流"
                 )
         if not finished:
             raise UpstreamError("Qwen3-ASR 流式响应提前结束，未收到正常结束标记；未使用不完整正文")
@@ -364,20 +364,3 @@ class ServiceClients:
         if not isinstance(body.get("turns"), list):
             raise UpstreamError("说话人服务响应缺少 turns 数组")
         return body["turns"]
-
-    def align(self, waveform, sample_rate: int, text: str, language: str) -> list:
-        limit = alignment_text_limit(len(waveform) / sample_rate)
-        if len(text) > limit:
-            raise ChunkInferenceError(
-                f"对齐文本异常过长：{len(text)} 字符，当前音频块上限 {limit} 字符"
-            )
-        body = self._post(
-            self.settings.aligner_api_url,
-            wav_bytes(waveform, sample_rate),
-            {"text": text, "language": language},
-            self.settings.internal_api_key,
-            "ForcedAligner",
-        )
-        if not isinstance(body.get("words"), list):
-            raise UpstreamError("对齐服务响应缺少 words 数组")
-        return body["words"]

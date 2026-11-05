@@ -1,4 +1,4 @@
-# GPU image shared by the Community-1 and ForcedAligner services.
+# GPU image for the Community-1 diarization service.
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
@@ -11,4 +11,4 @@ COPY requirements-gpu.txt ./
 COPY *.py ./
 COPY swagger_assets ./swagger_assets
 RUN python -m pip install . -r requirements-gpu.txt
-EXPOSE 8002 8003
+EXPOSE 8002

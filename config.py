@@ -9,31 +9,25 @@ class Settings:
     asr_model: str = ""
     asr_api_key: str = field(default="", repr=False)
     diarization_api_url: str = "http://diarization:8002/v1/diarization"
-    aligner_api_url: str = "http://aligner:8003/v1/alignment"
     internal_api_key: str = field(default="", repr=False)
     service_api_key: str = field(default="", repr=False)
     api_timeout_seconds: float = 600
     asr_timeout_seconds: float = 90
     asr_max_completion_tokens: int = 1024
     asr_chunk_seconds: float = 30
-    aligner_model: str = "/models/Qwen3-ForcedAligner-0.6B"
     diarization_model: str = "/models/speaker-diarization-community-1"
-    aligner_device: str = "cuda:0"
     diarization_device: str = "cuda:0"
     gpu_pending_requests: int = 4
     job_workers: int = 2
     max_pending_jobs: int = 100
     job_directory: str = "outputs/jobs"
     merge_gap_seconds: float = 1.5
-    max_speaker_distance: float = 0.75
     max_upload_mb: int = 500
     max_audio_seconds: float = 3600
 
     def __post_init__(self):
-        for name in ("merge_gap_seconds", "max_speaker_distance"):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f"{name} 必须是大于等于 0 的有限数字")
+        if not math.isfinite(self.merge_gap_seconds) or self.merge_gap_seconds < 0:
+            raise ValueError("merge_gap_seconds 必须是大于等于 0 的有限数字")
         for name in (
             "max_audio_seconds",
             "api_timeout_seconds",
@@ -43,8 +37,6 @@ class Settings:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} 必须大于 0")
-        if self.asr_chunk_seconds > 180:
-            raise ValueError("asr_chunk_seconds 不能超过对齐模型的 180 秒分块上限")
         if (
             isinstance(self.asr_max_completion_tokens, bool)
             or not isinstance(self.asr_max_completion_tokens, int)

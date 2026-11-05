@@ -1,5 +1,4 @@
-# GPU services only. Cloud desktop/API uses pyproject.toml and does not read this file.
-qwen-asr==0.0.6
+# Community-1 only. Cloud desktop/API uses pyproject.toml and does not read this file.
 pyannote-audio==4.0.7
 torch>=2.8,<2.9
 torchaudio>=2.8,<2.9
