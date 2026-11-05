@@ -1,5 +1,7 @@
 import json
 import logging
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Lock
 
@@ -144,11 +146,15 @@ def test_cli_failure_exit_and_closes_client(tmp_path, monkeypatch):
         == 1
     )
     assert pipeline.closed
-    log = (tmp_path / "out" / "batch.log").read_text(encoding="utf-8")
+    directories = list((tmp_path / "out").iterdir())
+    assert len(directories) == 1 and directories[0].is_dir()
+    log = (directories[0] / "batch.log").read_text(encoding="utf-8")
     assert "Python：" in log and "本次配置：" in log
     assert "[asr-file_0]" in log or "[asr-file_1]" in log
     assert "ASR unavailable" in log and "Traceback" in log
     assert "处理结束" in log
+    timing_report = (directories[0] / "timing-report.txt").read_text(encoding="utf-8")
+    assert "批次耗时报告" in timing_report and "失败原因：ASR unavailable" in timing_report
 
 
 def test_custom_log_file_captures_worker_messages_and_restores_logging(tmp_path, monkeypatch):
@@ -177,6 +183,117 @@ def test_custom_log_file_captures_worker_messages_and_restores_logging(tmp_path,
     assert not (tmp_path / "out" / "batch.log").exists()
     assert logging.getLogger().level == previous_level
     assert logging.getLogger().handlers == handlers
+
+
+def test_cli_separates_batches_and_resume_reuses_only_the_selected_directory(tmp_path, monkeypatch):
+    source, root = tmp_path / "audio", tmp_path / "results"
+    audio(source, "meeting.wav")
+    pipelines = []
+    monkeypatch.setattr(
+        batch.Settings, "from_env", lambda: Settings(asr_api_url="http://asr/upload")
+    )
+
+    def make_pipeline(_settings):
+        pipeline = FakePipeline()
+        pipelines.append(pipeline)
+        return pipeline
+
+    monkeypatch.setattr(batch, "MeetingPipeline", make_pipeline)
+    arguments = [str(source), "--output-dir", str(root)]
+    assert batch.main(arguments) == 0
+    first = next(root.iterdir())
+    assert re.fullmatch(r"\d{8}_\d{6}_[0-9a-f]{8}", first.name)
+    summary = json.loads((first / "batch-summary.json").read_text(encoding="utf-8"))
+    assert summary["batch_id"] == first.name
+    assert datetime.fromisoformat(summary["started_at"]).utcoffset() == timedelta(hours=8)
+    assert datetime.fromisoformat(summary["finished_at"]) >= datetime.fromisoformat(
+        summary["started_at"]
+    )
+    (first / "meeting.wav.txt").write_text("保留第一批结果", encoding="utf-8")
+    assert batch.main(arguments) == 0
+    assert len(list(root.iterdir())) == 2
+    assert (first / "meeting.wav.txt").read_text(encoding="utf-8") == "保留第一批结果"
+    assert all((directory / "timing-report.txt").is_file() for directory in root.iterdir())
+
+    assert batch.main([str(source), "--resume-dir", str(first)]) == 0
+    assert len(list(root.iterdir())) == 2
+    assert pipelines[-1].calls == [] and all(p.closed for p in pipelines)
+    resumed = json.loads((first / "batch-summary.json").read_text(encoding="utf-8"))
+    assert resumed["skipped"] == 1 and resumed["completed"] == 0
+    assert resumed["timing_summary"]["processed_files"]["count"] == 0
+    assert resumed["timing_summary"]["processed_files"]["average_seconds"] is None
+    assert all(stage["count"] == 0 for stage in resumed["timing_summary"]["stages"].values())
+    assert "复用已有结果" in (first / "timing-report.txt").read_text(encoding="utf-8")
+
+
+def test_resume_requires_an_existing_directory(tmp_path, monkeypatch):
+    def unexpected_pipeline(_settings):
+        pytest.fail("无效续跑目录不应调用模型")
+
+    monkeypatch.setattr(batch, "MeetingPipeline", unexpected_pipeline)
+    with pytest.raises(SystemExit) as caught:
+        batch.main([str(tmp_path / "audio"), "--resume-dir", str(tmp_path / "missing")])
+    assert caught.value.code == 2
+    assert not (tmp_path / "missing").exists()
+
+
+def test_timing_report_averages_include_failures_and_exclude_cached_results(tmp_path, monkeypatch):
+    source, output = tmp_path / "audio", tmp_path / "results"
+    for name in ("bad.wav", "good.wav", "skip.wav"):
+        audio(source, name)
+    output.mkdir()
+    cached = FakePipeline().transcribe(source / "skip.wav")
+    cached["timings"] = {"asr_seconds": 999}
+    (output / "skip.wav.txt").write_text("已有结果", encoding="utf-8")
+    (output / "skip.wav.json").write_text(json.dumps(cached), encoding="utf-8")
+    clock = [0.0]
+    monkeypatch.setattr(batch, "perf_counter", lambda: clock[0])
+
+    class TimedPipeline(FakePipeline):
+        def transcribe(self, path, **options):
+            if path.name == "bad.wav":
+                clock[0] += 20
+                error = UpstreamError("ASR 超时")
+                error.timings = {"decode_seconds": 1, "diarization_seconds": 4, "asr_seconds": 10}
+                error.duration_seconds = 100
+                error.processing_seconds = 20
+                raise error
+            result = super().transcribe(path, **options)
+            clock[0] += 10
+            result.update(
+                duration=60,
+                processing_seconds=10,
+                timings={
+                    "decode_seconds": 1,
+                    "diarization_seconds": 2,
+                    "asr_seconds": 6,
+                    "assembly_seconds": 1,
+                },
+            )
+            return result
+
+    report = batch.run_batch(source, output, TimedPipeline(), skip_existing=True)
+    assert report["processing_seconds"] == 30
+    stats = report["timing_summary"]
+    assert stats["processed_files"] == {"count": 2, "total_seconds": 30, "average_seconds": 15}
+    assert stats["completed_files"] == {"count": 1, "total_seconds": 10, "average_seconds": 10}
+    assert stats["stages"]["diarization_seconds"] == {
+        "count": 2,
+        "total_seconds": 6,
+        "average_seconds": 3,
+    }
+    assert stats["stages"]["asr_seconds"] == {
+        "count": 2,
+        "total_seconds": 16,
+        "average_seconds": 8,
+    }
+    assert stats["stages"]["assembly_seconds"]["count"] == 1
+    assert stats["stages"]["write_seconds"]["count"] == 1
+    assert [item["processing_seconds"] for item in report["files"]] == [20, 10, 0]
+    text = (output / "timing-report.txt").read_text(encoding="utf-8")
+    assert "失败原因：ASR 超时" in text and "平均 0分15.000秒" in text
+    assert "ASR 转写：统计 2 个" in text and "999" not in text
+    assert json.loads((output / "batch-summary.json").read_text(encoding="utf-8")) == report
 
 
 def test_failure_logging_preserves_redacted_error_without_private_transport_cause(tmp_path):

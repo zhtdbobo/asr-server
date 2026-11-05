@@ -8,15 +8,25 @@ import sys
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
 from traceback import format_exception
 from uuid import uuid4
 
+from clients import UpstreamError
 from config import Settings
 from pipeline import MeetingPipeline, validate_options
 
 logger = logging.getLogger(__name__)
+REPORT_TIMEZONE = timezone(timedelta(hours=8))
+TIMING_LABELS = {
+    "decode_seconds": "解码与预处理",
+    "diarization_seconds": "说话人分离",
+    "asr_seconds": "ASR 转写",
+    "assembly_seconds": "结果组装",
+    "write_seconds": "结果写入",
+}
 
 AUDIO_EXTENSIONS = {
     ".wav",
@@ -34,6 +44,112 @@ AUDIO_EXTENSIONS = {
     ".caf",
     ".mka",
 }
+
+
+def report_time() -> str:
+    return datetime.now(REPORT_TIMEZONE).isoformat(timespec="milliseconds")
+
+
+def create_batch_directory(root: Path) -> Path:
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    while True:
+        stamp = datetime.now(REPORT_TIMEZONE).strftime("%Y%m%d_%H%M%S")
+        directory = root / f"{stamp}_{uuid4().hex[:8]}"
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            continue
+        return directory
+
+
+def duration_text(seconds: float | None) -> str:
+    if seconds is None:
+        return "未记录"
+    # Round first so a value near a minute does not display as 0分60.000秒.
+    milliseconds = round(seconds * 1000)
+    minutes, milliseconds = divmod(milliseconds, 60000)
+    hours, minutes = divmod(minutes, 60)
+    prefix = f"{hours}时{minutes:02d}分" if hours else f"{minutes}分"
+    return f"{prefix}{milliseconds / 1000:06.3f}秒（{seconds:.3f} 秒）"
+
+
+def timing_statistics(values) -> dict:
+    samples = [value for value in values if value is not None]
+    total = sum(samples)
+    return {
+        "count": len(samples),
+        "total_seconds": round(total, 3),
+        "average_seconds": round(total / len(samples), 3) if samples else None,
+    }
+
+
+def format_timing_report(report: dict) -> str:
+    summary = report["timing_summary"]
+    labels = {"completed": "成功", "failed": "失败", "skipped": "跳过"}
+    lines = [
+        "批次耗时报告",
+        f"批次编号：{report['batch_id']}",
+        f"输入目录：{report['input_dir']}",
+        f"结果目录：{report['output_dir']}",
+        f"开始时间：{report['started_at']}",
+        f"结束时间：{report['finished_at']}",
+        f"批次总耗时：{duration_text(report['processing_seconds'])}",
+        (
+            f"文件统计：共 {report['total']} 个，成功 {report['completed']} 个，"
+            f"失败 {report['failed']} 个，跳过 {report['skipped']} 个"
+        ),
+        f"并发文件数：{report['workers']}",
+        "",
+        "耗时汇总",
+    ]
+    for key, title in (
+        ("processed_files", "实际处理文件（含失败，不含跳过）"),
+        ("completed_files", "成功文件"),
+    ):
+        values = summary[key]
+        lines.append(
+            f"{title}：统计 {values['count']} 个，累计 {duration_text(values['total_seconds'])}，"
+            f"平均 {duration_text(values['average_seconds'])}"
+        )
+    for key, title in TIMING_LABELS.items():
+        values = summary["stages"][key]
+        lines.append(
+            f"{title}：统计 {values['count']} 个，累计 {duration_text(values['total_seconds'])}，"
+            f"平均 {duration_text(values['average_seconds'])}"
+        )
+    lines.extend(
+        [
+            "",
+            "说明：批次总耗时为实际经过时间；并发文件的耗时可能重叠，累计值不等于批次总耗时。",
+            (
+                "说明：阶段耗时包含客户端传输、等待及推理，不是纯 GPU 耗时；"
+                "未记录的数据不参与阶段平均，跳过文件不参与处理平均。"
+            ),
+            "",
+            "逐文件明细",
+        ]
+    )
+    for item in report["files"]:
+        lines.extend(
+            [
+                "",
+                f"文件：{item['file']}",
+                f"状态：{labels[item['status']]}",
+                f"开始时间：{item['started_at']}",
+                f"结束时间：{item['finished_at']}",
+                f"单文件总耗时：{duration_text(item['processing_seconds'])}",
+                f"音频时长：{duration_text(item.get('duration_seconds'))}",
+            ]
+        )
+        if item["status"] == "skipped":
+            lines.append("  复用已有结果，本次仅记录缓存检查耗时。")
+        else:
+            for key, title in TIMING_LABELS.items():
+                lines.append(f"  {title}：{duration_text(item.get('timings', {}).get(key))}")
+        if item.get("error"):
+            lines.append(f"失败原因：{item['error']}")
+    return "\n".join(lines) + "\n"
 
 
 @contextmanager
@@ -140,17 +256,19 @@ def run_batch(
 ) -> dict:
     if workers < 1:
         raise ValueError("workers 必须大于 0")
+    started_at = report_time()
+    started = perf_counter()
     folder, output_dir = folder.resolve(), output_dir.resolve()
     files = discover_audio(folder, output_dir, recursive)
     if not files:
         raise ValueError("文件夹中没有支持的音频文件；如音频在子目录，请加 --recursive")
     options = options or {}
-    started = perf_counter()
     logger.info(
         f"找到 {len(files)} 个音频，最多同时处理 {workers} 个；JSON 用于对比，TXT 用于阅读。",
     )
 
     def process(path):
+        file_started = perf_counter()
         relative = path.relative_to(folder)
         # Retain the extension so meeting.wav and meeting.mp3 cannot overwrite each other.
         text_path = output_dir / relative.parent / f"{relative.name}.txt"
@@ -160,7 +278,14 @@ def run_batch(
             "file": relative.as_posix(),
             "text_file": str(text_path),
             "json_file": str(json_path),
+            "started_at": report_time(),
         }
+
+        def finish(outcome):
+            outcome["finished_at"] = report_time()
+            outcome["processing_seconds"] = round(perf_counter() - file_started, 3)
+            return outcome
+
         try:
             if skip_existing and text_path.is_file() and json_path.is_file():
                 try:
@@ -183,25 +308,40 @@ def run_batch(
                         write_outputs(updates)
                     if full_json_path.is_file():
                         item["full_json_file"] = str(full_json_path)
-                    return {**item, "status": "skipped", "json_updated": bool(updates)}
+                    return finish({**item, "status": "skipped", "json_updated": bool(updates)})
             logger.info("[开始] %s", relative)
             result = pipeline.transcribe(path, **options)
             segments = comparison_segments(result)
-            logger.info("[%s] 开始写入 TXT、对比 JSON 和完整 JSON", relative)
-            write_outputs(
-                {
-                    text_path: result["formatted_text"] + "\n",
-                    json_path: json.dumps(segments, ensure_ascii=False, indent=2) + "\n",
-                    full_json_path: json.dumps(result, ensure_ascii=False, indent=2) + "\n",
-                }
+            item.update(
+                duration_seconds=result.get("duration"),
+                transcription_seconds=result.get("processing_seconds"),
+                timings=dict(result.get("timings", {})),
             )
+            logger.info("[%s] 开始写入 TXT、对比 JSON 和完整 JSON", relative)
+            writing_started = perf_counter()
+            try:
+                write_outputs(
+                    {
+                        text_path: result["formatted_text"] + "\n",
+                        json_path: json.dumps(segments, ensure_ascii=False, indent=2) + "\n",
+                        full_json_path: json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                    }
+                )
+            finally:
+                item["timings"]["write_seconds"] = round(perf_counter() - writing_started, 3)
             logger.info("[%s] 三份结果文件写入完成", relative)
-            return {**item, "full_json_file": str(full_json_path), "status": "completed"}
+            return finish({**item, "full_json_file": str(full_json_path), "status": "completed"})
         except Exception as exc:  # noqa: BLE001 - A failed input must not abort other files.
+            if isinstance(exc, UpstreamError):
+                item.update(
+                    duration_seconds=getattr(exc, "duration_seconds", None),
+                    transcription_seconds=getattr(exc, "processing_seconds", None),
+                    timings=getattr(exc, "timings", {}),
+                )
             # Upstream errors redact secrets; don't print their raw transport causes.
             details = "".join(format_exception(type(exc), exc, exc.__traceback__, chain=False))
             logger.error("[%s] 处理失败\n%s", relative, details.rstrip())
-            return {**item, "status": "failed", "error": str(exc)}
+            return finish({**item, "status": "failed", "error": str(exc)})
 
     results = []
     labels = {"completed": "成功", "failed": "失败", "skipped": "跳过"}
@@ -232,18 +372,37 @@ def run_batch(
                     f"[{len(results)}/{len(files)}] {labels[item['status']]} {item['file']}{suffix}",
                 )
 
+    processed = [item for item in results if item["status"] != "skipped"]
     report = {
+        "batch_id": output_dir.name,
         "input_dir": str(folder),
         "output_dir": str(output_dir),
+        "started_at": started_at,
+        "finished_at": report_time(),
+        "workers": workers,
         "total": len(files),
         "completed": sum(item["status"] == "completed" for item in results),
         "failed": sum(item["status"] == "failed" for item in results),
         "skipped": sum(item["status"] == "skipped" for item in results),
         "processing_seconds": round(perf_counter() - started, 3),
+        "timing_summary": {
+            "processed_files": timing_statistics(item["processing_seconds"] for item in processed),
+            "completed_files": timing_statistics(
+                item["processing_seconds"] for item in processed if item["status"] == "completed"
+            ),
+            "stages": {
+                key: timing_statistics(item.get("timings", {}).get(key) for item in processed)
+                for key in TIMING_LABELS
+            },
+        },
         "files": sorted(results, key=lambda item: item["file"].casefold()),
     }
     write_outputs(
-        {output_dir / "batch-summary.json": json.dumps(report, ensure_ascii=False, indent=2) + "\n"}
+        {
+            output_dir / "batch-summary.json": json.dumps(report, ensure_ascii=False, indent=2)
+            + "\n",
+            output_dir / "timing-report.txt": format_timing_report(report),
+        }
     )
     return report
 
@@ -254,14 +413,26 @@ def main(argv=None):
             stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="批量处理本地文件夹中的音频，生成发言人和时间戳")
     parser.add_argument("folder", type=Path, help="云桌面上的音频文件夹")
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/batch"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs/batch"),
+        help="输出父目录；每次新建带北京时间戳和唯一标识的批次子目录",
+    )
+    parser.add_argument(
+        "--resume-dir",
+        type=Path,
+        help="续跑已有批次目录，自动复用已有有效 TXT/JSON",
+    )
     parser.add_argument(
         "--log-file", type=Path, help="日志文件，默认输出目录下的 batch.log（追加）"
     )
     parser.add_argument("--recursive", action="store_true", help="同时处理子文件夹")
     parser.add_argument("--workers", type=int, default=1, help="同时处理文件数，默认 1")
     parser.add_argument(
-        "--skip-existing", action="store_true", help="复用已有 TXT、JSON；旧 JSON 自动转换"
+        "--skip-existing",
+        action="store_true",
+        help="复用当前批次的 TXT/JSON；续跑请用 --resume-dir",
     )
     parser.add_argument(
         "--timeout-seconds", type=float, help="每次远程请求的读写等待超时秒数，默认读取 .env"
@@ -273,10 +444,24 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers 必须大于 0")
-    log_path = (args.log_file or args.output_dir / "batch.log").resolve()
     try:
+        if args.resume_dir is not None:
+            args.output_dir = args.resume_dir.resolve()
+            if not args.output_dir.is_dir():
+                parser.error("--resume-dir 必须指向已有的批次目录")
+            args.skip_existing = True
+        else:
+            args.output_dir = create_batch_directory(args.output_dir)
+        log_path = (args.log_file or args.output_dir / "batch.log").resolve()
         with batch_logging(log_path):
+            logger.info(
+                "批次目录：%s（%s）", args.output_dir, "续跑" if args.resume_dir else "新建"
+            )
             logger.info("批处理日志文件：%s", log_path)
+            if args.skip_existing and args.resume_dir is None:
+                logger.info(
+                    "本次使用新批次目录；若要复用之前的结果，请用 --resume-dir 指定旧批次目录"
+                )
             logger.info("Python：%s；版本：%s", sys.executable, sys.version.split()[0])
             return run_cli(args, parser)
     except OSError as exc:
@@ -321,7 +506,11 @@ def run_cli(args, parser):
     logger.info(
         f"\n处理结束：共 {report['total']} 个，成功 {report['completed']} 个，"
         f"失败 {report['failed']} 个，跳过 {report['skipped']} 个。\n"
-        f"汇总：{args.output_dir.resolve() / 'batch-summary.json'}"
+        f"结果目录：{args.output_dir.resolve()}\n"
+        f"汇总：{args.output_dir.resolve() / 'batch-summary.json'}\n"
+        f"耗时报告：{args.output_dir.resolve() / 'timing-report.txt'}\n"
+        f"批次总耗时：{duration_text(report['processing_seconds'])}；"
+        f"平均单文件耗时：{duration_text(report['timing_summary']['processed_files']['average_seconds'])}"
     )
     return 1 if report["failed"] else 0
 

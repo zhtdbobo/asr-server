@@ -112,7 +112,7 @@ docker compose --env-file .env.gpu rm -f aligner
 
 新版流程验证成功、旧对齐容器停止后，可以删除服务器上的 `./models/Qwen3-ForcedAligner-0.6B` 模型目录，释放磁盘空间。保留 `speaker-diarization-community-1` 和现有 Qwen3-ASR 权重。新版源码和 GPU 依赖不再需要 `qwen-asr` 包；若要精简旧 GPU 镜像，需重建、导入镜像后重新创建 `diarization` 容器。现有独立 ASR 服务仍需要自己的 Qwen 环境。
 
-用 `--skip-existing` 会继续复用旧结果；需要验证新流程或重新生成段落时间戳时，使用新的输出目录或省略该选项。
+用 `--resume-dir "旧结果目录"` 会继续复用有效旧结果；需要验证新流程或重新生成段落时间戳时，正常启动新批次即可。
 
 ## 对外调用
 
@@ -236,10 +236,23 @@ FFmpeg 需另外准备并加入云桌面的 PATH。
 python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果"
 ```
 
-默认处理当前文件夹的 WAV、MP3、M4A、FLAC、AAC、OGG、OPUS、WMA、AMR、AIFF 等音频，一次处理一个文件。包括子文件夹、同时处理两个文件、跳过已有结果：
+`--output-dir` 是输出父目录；每次正常启动都会新建“北京时间戳 + 8 位唯一标识”的批次子目录，在启动和结束时打印完整位置。不同批次不会覆盖结果，默认日志也各自保存。例如：
+
+```text
+D:/转写结果/
+└── 20261105_203015_a1b2c3d4/
+    ├── batch.log
+    ├── batch-summary.json
+    ├── timing-report.txt
+    ├── 会议.wav.txt
+    ├── 会议.wav.json
+    └── 会议.wav.full.json
+```
+
+默认处理当前文件夹的 WAV、MP3、M4A、FLAC、AAC、OGG、OPUS、WMA、AMR、AIFF 等音频，一次处理一个文件。包括子文件夹、同时处理两个文件：
 
 ```bash
-python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --recursive --workers 2 --skip-existing
+python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --recursive --workers 2
 ```
 
 每个音频保存以下结果，并保留输入子目录结构：
@@ -248,13 +261,23 @@ python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --recursiv
 - `会议.wav.json`：与 TextGrid 转换结果相同的片段数组，每项仅包含 `speaker`、`start`、`end`、`text`，时间单位为秒，按开始时间排序，方便对比。
 - `会议.wav.full.json`：完整识别结果，包含 `segments`、段落时间戳、说话人时间线、耗时和警告（`words` 为空），方便排查问题。
 
-文件名保留原音频扩展名，避免同名 WAV 和 MP3 相互覆盖。单文件失败后继续，结束时保存 `batch-summary.json`，列出每个文件的状态、输出位置和失败原因；有失败时脚本退出码为 1，全部成功或跳过时为 0。同步 API 和单文件 `transcribe.py` 仍输出完整结果对象。
+文件名保留原音频扩展名，避免同名 WAV 和 MP3 相互覆盖。单文件失败后继续，结束时在实际批次目录保存 `batch-summary.json` 和 `timing-report.txt`，列出每个文件的状态、输出位置、开始与结束时间、耗时和失败原因；有失败时脚本退出码为 1，全部成功或跳过时为 0。同步 API 和单文件 `transcribe.py` 仍输出完整结果对象。
 
-`--skip-existing` 在对应 TXT 和有效 JSON 都存在时复用结果。如果 JSON 来自旧版本的完整结果对象，会将其转为片段数组，并把原完整内容保存到 `.full.json`，不重复调用推理服务，TXT 保持原样；无效 JSON 或缺少 TXT/JSON 时重新处理。默认不加此参数时重新处理并覆盖输出。修改输入音频、模型或识别参数后，应省略此选项重新处理。还支持 `--language`、`--num-speakers`、`--min-speakers`、`--max-speakers`；文件间人数不同可不指定，让模型分别判断。每个音频的发言人编号独立。
+续跑时使用 `--resume-dir` 指向已有的实际批次目录，自动启用 `--skip-existing`，复用对应 TXT 和有效 JSON，不新建批次目录：
+
+```bash
+python batch_transcribe.py "D:/录音" --resume-dir "D:/转写结果/20261105_203015_a1b2c3d4" --recursive --workers 2
+```
+
+旧版没有时间戳子目录的结果，也可以直接用 `--resume-dir "D:/旧转写结果"` 续跑。如果 JSON 来自旧版本的完整结果对象，会将其转为片段数组，并把原完整内容保存到 `.full.json`，不重复调用推理服务，TXT 保持原样；无效 JSON 或缺少 TXT/JSON 时重新处理。续跑会追加日志，汇总和耗时报告更新为本次执行的数据；跳过文件不会沿用旧模型耗时参与本次平均。单独给新批次加 `--skip-existing` 无法复用其他批次的结果。修改输入音频、模型或识别参数后，正常启动新批次重新处理。
+
+耗时报告包括批次实际总耗时、每个文件的耗时、实际处理文件平均耗时（含失败、不含跳过）、成功文件平均耗时，以及解码、说话人分离、ASR、结果组装和写入各阶段的累计与平均耗时。单文件总耗时从该文件开始执行计到结果写入或失败，不包含线程池排队时间；批次总耗时包含文件扫描、排队与处理，统计到所有文件结束，不包含最终报告的落盘。并发时各文件耗时之和可能大于批次总耗时。阶段平均值仅使用有记录的数据，逐项显示统计文件数；上游失败会保留已完成阶段和失败阶段截至报错的耗时，未执行阶段显示“未记录”，不按零秒参与平均。阶段耗时包含云桌面的传输、服务等待、推理及重试，不表示纯 GPU 计算耗时。
+
+`batch-summary.json` 的 `timing_summary` 保存实际处理、成功文件和各阶段的 `count`、`total_seconds`、`average_seconds`，无有效样本时平均值为 `null`。逐文件记录还包含 `duration_seconds`、`processing_seconds` 和 `timings`；`.full.json` 也包含流水线的分阶段 `timings`。还支持 `--language`、`--num-speakers`、`--min-speakers`、`--max-speakers`；文件间人数不同可不指定，让模型分别判断。每个音频的发言人编号独立。
 
 终端会显示当前文件、音频时长、分块时间范围、说话人分段和逐段 ASR 阶段，以及请求开始、耗时和重试次数。如果 15 秒内没有文件完成，会打印当前处理的文件与本批次耗时。HTTP 200 只代表该次请求成功，不能据此判断整段录音已经处理完；同一录音还可能继续请求后续分块。
 
-批处理默认把同样的日志追加写入输出目录下的 `batch.log`，包含线程名、Python 路径、配置摘要和失败位置。也可指定独立日志文件：
+批处理默认把同样的日志追加写入实际批次目录下的 `batch.log`，包含线程名、Python 路径、配置摘要和失败位置。也可用 `--log-file` 显式指定其他日志路径：
 
 ```bash
 uv run --no-sync python batch_transcribe.py "D:/录音" --output-dir "outputs/transcribe" --log-file "outputs/transcribe/debug.log"
@@ -285,7 +308,7 @@ ASR 在收到流式事件时每隔约 15 秒记录一次事件数、字符数和
 Community-1 的读写等待超时由 `.env` 的 `API_TIMEOUT_SECONDS` 控制，默认 600 秒，连接异常或部分临时 HTTP 错误最多尝试 3 次。可以在本次批处理中覆盖公共超时，例如：
 
 ```bash
-python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --skip-existing --timeout-seconds 120
+python batch_transcribe.py "D:/录音" --resume-dir "D:/转写结果/20261105_203015_a1b2c3d4" --timeout-seconds 120
 ```
 
 ASR 单独使用 `ASR_TIMEOUT_SECONDS`，默认 90 秒，实际等待上限取它和公共超时的较小值；每收到一行流式数据也检查已耗时，持续生成超过该设置时关闭响应。HTTP 读写超时限制的是一次网络等待，并非严格的整段录音总时限。ASR 连接失败或超时不自动重复提交，避免旧生成尚未取消时继续堆积请求。若终端停留在某个阶段，结合对应服务日志检查该请求。
@@ -310,9 +333,9 @@ CUDA_VISIBLE_DEVICES=0 qwen-asr-serve \
   --host 0.0.0.0 --port 80
 ```
 
-这里 1024 是本项目每个音频块的输出 token 上限，不表示音频秒数。按说话人时间段转写需要同步新版云桌面源码，尤其是 `pipeline.py`、`transcript.py`、`clients.py`、`config.py` 和 `pyproject.toml`，再停止旧批处理或重启主 API。已部署的 Community-1 接口仍兼容，可继续使用；新建精简镜像时再按前文重建 GPU 镜像。用 `--skip-existing` 重跑可复用已完成文件；尚未完成的文件从头处理，不从中间分块续跑。已提交的旧请求不会自动获得新的生成上限，关闭客户端响应后还应查看 ASR 日志，确认旧生成已经取消。
+这里 1024 是本项目每个音频块的输出 token 上限，不表示音频秒数。按说话人时间段转写需要同步新版云桌面源码，尤其是 `pipeline.py`、`transcript.py`、`clients.py`、`config.py` 和 `pyproject.toml`，再停止旧批处理或重启主 API。已部署的 Community-1 接口仍兼容，可继续使用；新建精简镜像时再按前文重建 GPU 镜像。用 `--resume-dir` 指定旧批次目录可复用已完成文件；尚未完成的文件从头处理，不从中间分块续跑。已提交的旧请求不会自动获得新的生成上限，关闭客户端响应后还应查看 ASR 日志，确认旧生成已经取消。
 
-如果遇到 AliMeeting 原始多通道 WAV 上传 Community-1 时返回 HTTP 413，请将更新后的 `pipeline.py` 和 `clients.py` 同步到云桌面实际运行目录后，结束旧批处理，再用 `--skip-existing` 重新启动。主流程会上传整段单声道 PCM16，不需要单纯调大 GPU 上传限制。处理失败的文件会重试，已有有效 TXT/JSON 的文件会复用。
+如果遇到 AliMeeting 原始多通道 WAV 上传 Community-1 时返回 HTTP 413，请将更新后的 `pipeline.py` 和 `clients.py` 同步到云桌面实际运行目录后，结束旧批处理，再用 `--resume-dir` 指定旧结果目录重新启动。主流程会上传整段单声道 PCM16，不需要单纯调大 GPU 上传限制。处理失败的文件会重试，已有有效 TXT/JSON 的文件会复用。
 
 `--workers` 控制本次脚本的并发文件数，独立于运行中的 API 进程；脚本和 API 同时运行时，远程服务承受两者合计的请求。此脚本是一次性批处理，不会持续监控目录，也不将任务写入 API 的 SQLite 队列。运行环境仍需基础 Python 依赖和 FFmpeg，模型和 GPU 继续位于服务器。
 
@@ -350,13 +373,13 @@ python textgrid_to_json.py "D:/AliMeeting/Eval_Ali" --output-dir "outputs/refere
 `compare_transcripts.py` 只使用 Python 标准库，无需 GPU 或安装额外依赖。比较远场识别结果和之前生成的远场 reference，Windows PowerShell/CMD 均可运行下面这一行：
 
 ```bash
-python compare_transcripts.py --reference "outputs/reference/Eval_Ali/Eval_Ali_far/textgrid_dir" --hypothesis "outputs/transcribe" --output-dir "outputs/comparison"
+python compare_transcripts.py --reference "outputs/reference/Eval_Ali/Eval_Ali_far/textgrid_dir" --hypothesis "outputs/transcribe/20261105_203015_a1b2c3d4" --output-dir "outputs/comparison"
 ```
 
-将 `--hypothesis` 改成批处理实际的输出目录；脚本递归搜索 JSON。也支持直接指定两个 JSON 文件，不要求文件名一致：
+将 `--hypothesis` 改成某一个实际批次的输出目录，避免同时读入多个批次的同名结果；脚本递归搜索 JSON。也支持直接指定两个 JSON 文件，不要求文件名一致：
 
 ```bash
-python compare_transcripts.py --reference "outputs/reference/Eval_Ali/Eval_Ali_far/textgrid_dir/R8001_M8004.json" --hypothesis "outputs/transcribe/R8001_M8004_MS801.wav.json" --output-dir "outputs/comparison"
+python compare_transcripts.py --reference "outputs/reference/Eval_Ali/Eval_Ali_far/textgrid_dir/R8001_M8004.json" --hypothesis "outputs/transcribe/20261105_203015_a1b2c3d4/R8001_M8004_MS801.wav.json" --output-dir "outputs/comparison"
 ```
 
 比较逻辑不要求段数、边界或说话人名称一致：

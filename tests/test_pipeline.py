@@ -257,3 +257,55 @@ def test_large_multichannel_input_is_not_uploaded_to_diarization(tmp_path, monke
 
 def test_chunk_limit_no_longer_depends_on_aligner():
     assert Settings(asr_chunk_seconds=240).asr_chunk_seconds == 240
+
+
+@pytest.mark.parametrize("problem", ["truncated", "network"])
+def test_stage_timings_cover_retries_and_failed_stage_waiting(monkeypatch, problem):
+    import pipeline as module
+
+    clock = [0.0]
+    monkeypatch.setattr(module, "perf_counter", lambda: clock[0])
+
+    def decode(*_):
+        clock[0] += 2
+        return np.zeros(320000), 16000
+
+    monkeypatch.setattr(module, "decode_audio", decode)
+    original_build = module.build_transcript
+
+    def assemble(**options):
+        result = original_build(**options)
+        clock[0] += 1
+        return result
+
+    monkeypatch.setattr(module, "build_transcript", assemble)
+
+    class TimedServices(RecoveringServices):
+        def diarize(self, path, options):
+            clock[0] += 3
+            return super().diarize(path, options)
+
+        def recognize(self, waveform, sr):
+            clock[0] += 7 if problem == "network" else [1, 4, 5][len(self.recognized_lengths)]
+            return super().recognize(waveform, sr)
+
+    engine = MeetingPipeline(Settings(asr_api_url="http://asr/upload"), TimedServices(problem))
+    if problem == "network":
+        with pytest.raises(UpstreamError) as caught:
+            engine.transcribe("audio.wav")
+        assert caught.value.timings == {
+            "decode_seconds": 2,
+            "diarization_seconds": 3,
+            "asr_seconds": 7,
+        }
+        assert caught.value.processing_seconds == 12
+        assert caught.value.duration_seconds == 20
+    else:
+        result = engine.transcribe("audio.wav")
+        assert result["timings"] == {
+            "decode_seconds": 2,
+            "diarization_seconds": 3,
+            "asr_seconds": 10,
+            "assembly_seconds": 1,
+        }
+        assert result["processing_seconds"] == 16

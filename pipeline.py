@@ -147,6 +147,9 @@ class MeetingPipeline:
         if not self._slots.acquire(blocking=False):
             raise PipelineBusyError("处理槽位已满，请使用 POST /v1/jobs 提交排队任务")
         started = perf_counter()
+        timings = {}
+        phase_name, phase_started = "decode_seconds", started
+        total_seconds = None
         try:
             name = Path(path).name
             if not self.settings.asr_api_url:
@@ -158,6 +161,9 @@ class MeetingPipeline:
             if sample_rate != SAMPLE_RATE:
                 raise RuntimeError("解码器返回了错误的采样率")
             total_seconds = len(waveform) / sample_rate
+            decoded_at = perf_counter()
+            timings[phase_name] = round(decoded_at - phase_started, 3)
+            phase_name, phase_started = "diarization_seconds", decoded_at
             logger.info("[%s] 解码完成，录音时长 %.1f 秒；开始说话人分离", name, total_seconds)
             try:
                 import soundfile as sf
@@ -187,6 +193,9 @@ class MeetingPipeline:
             except (KeyError, TypeError, ValueError, OverflowError) as exc:
                 raise UpstreamError(f"说话人服务返回了无效的时间区间：{exc}") from exc
             logger.info("[%s] 说话人分离完成，共 %d 个时间段", name, len(turns))
+            diarized_at = perf_counter()
+            timings[phase_name] = round(diarized_at - phase_started, 3)
+            phase_name, phase_started = "asr_seconds", diarized_at
             texts, retry_warnings = [], []
             for index, turn in enumerate(turns, start=1):
                 start_sample = round(turn.start * sample_rate)
@@ -215,6 +224,9 @@ class MeetingPipeline:
                     parts.extend(chunk_parts)
                     retry_warnings.extend(warnings)
                 texts.append(join_text(parts, language))
+            recognized_at = perf_counter()
+            timings[phase_name] = round(recognized_at - phase_started, 3)
+            phase_name, phase_started = "assembly_seconds", recognized_at
             logger.info("[%s] 按说话人时间段合并转写正文", name)
             output = build_transcript(
                 texts=texts,
@@ -223,7 +235,10 @@ class MeetingPipeline:
                 language=language,
                 merge_gap=self.settings.merge_gap_seconds,
             )
-            output["processing_seconds"] = round(perf_counter() - started, 3)
+            assembled_at = perf_counter()
+            output["processing_seconds"] = round(assembled_at - started, 3)
+            timings[phase_name] = round(assembled_at - phase_started, 3)
+            output["timings"] = timings
             output["warnings"].extend(retry_warnings)
             logger.info("[%s] 转写结果组装完成，共 %d 条警告", name, len(output["warnings"]))
             if not turns:
@@ -235,5 +250,12 @@ class MeetingPipeline:
                 output["processing_seconds"],
             )
             return output
+        except UpstreamError as exc:
+            finished = perf_counter()
+            timings[phase_name] = round(finished - phase_started, 3)
+            exc.timings = timings
+            exc.duration_seconds = total_seconds
+            exc.processing_seconds = round(finished - started, 3)
+            raise
         finally:
             self._slots.release()
