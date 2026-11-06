@@ -15,6 +15,7 @@ class Settings:
     asr_timeout_seconds: float = 90
     asr_max_completion_tokens: int = 1024
     asr_chunk_seconds: float = 30
+    asr_workers: int = 1
     diarization_model: str = "/models/speaker-diarization-community-1"
     diarization_device: str = "cuda:0"
     gpu_pending_requests: int = 4
@@ -43,6 +44,12 @@ class Settings:
             or self.asr_max_completion_tokens <= 0
         ):
             raise ValueError("asr_max_completion_tokens 必须为正整数")
+        if (
+            isinstance(self.asr_workers, bool)
+            or not isinstance(self.asr_workers, int)
+            or self.asr_workers <= 0
+        ):
+            raise ValueError("asr_workers 必须为正整数")
         for name in ("max_upload_mb", "gpu_pending_requests", "job_workers", "max_pending_jobs"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} 必须大于 0")

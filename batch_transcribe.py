@@ -86,6 +86,7 @@ def timing_statistics(values) -> dict:
 
 def format_timing_report(report: dict) -> str:
     summary = report["timing_summary"]
+    timing_labels = report.get("timing_labels", TIMING_LABELS)
     labels = {"completed": "成功", "failed": "失败", "skipped": "跳过"}
     lines = [
         "批次耗时报告",
@@ -112,7 +113,7 @@ def format_timing_report(report: dict) -> str:
             f"{title}：统计 {values['count']} 个，累计 {duration_text(values['total_seconds'])}，"
             f"平均 {duration_text(values['average_seconds'])}"
         )
-    for key, title in TIMING_LABELS.items():
+    for key, title in timing_labels.items():
         values = summary["stages"][key]
         lines.append(
             f"{title}：统计 {values['count']} 个，累计 {duration_text(values['total_seconds'])}，"
@@ -145,7 +146,7 @@ def format_timing_report(report: dict) -> str:
         if item["status"] == "skipped":
             lines.append("  复用已有结果，本次仅记录缓存检查耗时。")
         else:
-            for key, title in TIMING_LABELS.items():
+            for key, title in timing_labels.items():
                 lines.append(f"  {title}：{duration_text(item.get('timings', {}).get(key))}")
         if item.get("error"):
             lines.append(f"失败原因：{item['error']}")
@@ -253,6 +254,7 @@ def run_batch(
     recursive: bool = False,
     skip_existing: bool = False,
     options: dict | None = None,
+    timing_labels: dict[str, str] | None = None,
 ) -> dict:
     if workers < 1:
         raise ValueError("workers 必须大于 0")
@@ -263,6 +265,7 @@ def run_batch(
     if not files:
         raise ValueError("文件夹中没有支持的音频文件；如音频在子目录，请加 --recursive")
     options = options or {}
+    stage_labels = TIMING_LABELS if timing_labels is None else timing_labels
     logger.info(
         f"找到 {len(files)} 个音频，最多同时处理 {workers} 个；JSON 用于对比，TXT 用于阅读。",
     )
@@ -392,11 +395,13 @@ def run_batch(
             ),
             "stages": {
                 key: timing_statistics(item.get("timings", {}).get(key) for item in processed)
-                for key in TIMING_LABELS
+                for key in stage_labels
             },
         },
         "files": sorted(results, key=lambda item: item["file"].casefold()),
     }
+    if timing_labels is not None:
+        report["timing_labels"] = dict(stage_labels)
     write_outputs(
         {
             output_dir / "batch-summary.json": json.dumps(report, ensure_ascii=False, indent=2)
@@ -428,7 +433,10 @@ def main(argv=None):
         "--log-file", type=Path, help="日志文件，默认输出目录下的 batch.log（追加）"
     )
     parser.add_argument("--recursive", action="store_true", help="同时处理子文件夹")
-    parser.add_argument("--workers", type=int, default=1, help="同时处理文件数，默认 1")
+    parser.add_argument("--file-workers", type=int, default=1, help="同时处理文件数，默认 1")
+    parser.add_argument(
+        "--asr-workers", type=int, help="每个文件内部的 ASR 分块并发数，默认读取 ASR_WORKERS（1）"
+    )
     parser.add_argument(
         "--skip-existing",
         action="store_true",
@@ -442,8 +450,10 @@ def main(argv=None):
     parser.add_argument("--min-speakers", type=int)
     parser.add_argument("--max-speakers", type=int)
     args = parser.parse_args(argv)
-    if args.workers < 1:
-        parser.error("--workers 必须大于 0")
+    if args.file_workers < 1:
+        parser.error("--file-workers 必须大于 0")
+    if args.asr_workers is not None and args.asr_workers < 1:
+        parser.error("--asr-workers 必须大于 0")
     try:
         if args.resume_dir is not None:
             args.output_dir = args.resume_dir.resolve()
@@ -474,15 +484,20 @@ def run_cli(args, parser):
         language, counts = validate_options(
             args.language, args.num_speakers, args.min_speakers, args.max_speakers
         )
-        settings = replace(Settings.from_env(), job_workers=args.workers)
+        settings = replace(Settings.from_env(), job_workers=args.file_workers)
+        if args.asr_workers is not None:
+            settings = replace(settings, asr_workers=args.asr_workers)
         if args.timeout_seconds is not None:
             settings = replace(settings, api_timeout_seconds=args.timeout_seconds)
         if not settings.asr_api_url:
             raise ValueError("请先在 .env 中配置 ASR_API_URL")
         logger.info(
-            "本次配置：%d 个文件并发，ASR 子块上限 %.1f 秒，ASR 等待上限 %.1f 秒，"
+            "本次配置：%d 个文件并发，每个文件 %d 个 ASR 分块并发，"
+            "ASR 请求合计最多 %d 个，ASR 子块上限 %.1f 秒，ASR 等待上限 %.1f 秒，"
             "说话人读写等待上限 %.1f 秒",
             settings.job_workers,
+            settings.asr_workers,
+            settings.job_workers * settings.asr_workers,
             settings.asr_chunk_seconds,
             min(settings.api_timeout_seconds, settings.asr_timeout_seconds),
             settings.api_timeout_seconds,
@@ -492,7 +507,7 @@ def run_cli(args, parser):
             args.folder,
             args.output_dir,
             pipeline,
-            workers=args.workers,
+            workers=args.file_workers,
             recursive=args.recursive,
             skip_existing=args.skip_existing,
             options={"language": language, **counts},

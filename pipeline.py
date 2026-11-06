@@ -1,5 +1,6 @@
 import logging
 import tempfile
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import BoundedSemaphore
 from time import perf_counter
@@ -132,6 +133,82 @@ class MeetingPipeline:
         logger.info("%s ASR 完成，%d 字符", label, len(text))
         return [text], []
 
+    def _asr_chunks(self, waveform, sample_rate, turns, name):
+        for index, turn in enumerate(turns):
+            start_sample = round(turn.start * sample_rate)
+            end_sample = round(turn.end * sample_rate)
+            logger.info(
+                "[%s] 说话人片段 %d/%d %s [%.3f–%.3f / %.1f 秒]",
+                name,
+                index + 1,
+                len(turns),
+                turn.speaker,
+                turn.start,
+                turn.end,
+                len(waveform) / sample_rate,
+            )
+            for chunk_index, (chunk, local_offset) in enumerate(
+                audio_chunks(
+                    waveform[start_sample:end_sample], sample_rate, self.settings.asr_chunk_seconds
+                ),
+                start=1,
+            ):
+                yield (
+                    index,
+                    chunk,
+                    start_sample / sample_rate + local_offset,
+                    f"[{name}] 片段 {index + 1} 分块 {chunk_index}",
+                )
+
+    def _transcribe_turns(self, waveform, sample_rate, turns, name, language):
+        tasks = enumerate(self._asr_chunks(waveform, sample_rate, turns, name))
+        results = {}
+        logger.info("[%s] 开始 ASR，文件内最多 %d 个分块并发", name, self.settings.asr_workers)
+        if self.settings.asr_workers == 1:
+            for number, (turn_index, chunk, offset, label) in tasks:
+                results[number] = (
+                    turn_index,
+                    self._transcribe_chunk(chunk, sample_rate, offset, label),
+                )
+        else:
+            executor = ThreadPoolExecutor(
+                max_workers=self.settings.asr_workers, thread_name_prefix="asr-chunk"
+            )
+            pending = {}
+
+            def submit_next():
+                task = next(tasks, None)
+                if task is None:
+                    return
+                number, (turn_index, chunk, offset, label) = task
+                future = executor.submit(self._transcribe_chunk, chunk, sample_rate, offset, label)
+                pending[future] = (number, turn_index)
+
+            try:
+                # Keep only one task per worker in flight; do not queue the entire recording.
+                for _ in range(self.settings.asr_workers):
+                    submit_next()
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        number, turn_index = pending.pop(future)
+                        results[number] = (turn_index, future.result())
+                    for _ in done:
+                        submit_next()
+            finally:
+                # Drain running requests before releasing the file slot or closing HTTP clients.
+                for future in pending:
+                    future.cancel()
+                executor.shutdown(wait=True, cancel_futures=True)
+
+        texts = [[] for _ in turns]
+        retry_warnings = []
+        for number in sorted(results):
+            turn_index, (parts, warnings) = results[number]
+            texts[turn_index].extend(parts)
+            retry_warnings.extend(warnings)
+        return [join_text(parts, language) for parts in texts], retry_warnings
+
     def transcribe(
         self,
         path: str | Path,
@@ -196,34 +273,9 @@ class MeetingPipeline:
             diarized_at = perf_counter()
             timings[phase_name] = round(diarized_at - phase_started, 3)
             phase_name, phase_started = "asr_seconds", diarized_at
-            texts, retry_warnings = [], []
-            for index, turn in enumerate(turns, start=1):
-                start_sample = round(turn.start * sample_rate)
-                end_sample = round(turn.end * sample_rate)
-                turn_audio = waveform[start_sample:end_sample]
-                logger.info(
-                    "[%s] 说话人片段 %d/%d %s [%.3f–%.3f / %.1f 秒]",
-                    name,
-                    index,
-                    len(turns),
-                    turn.speaker,
-                    turn.start,
-                    turn.end,
-                    total_seconds,
-                )
-                parts = []
-                for chunk_index, (chunk, local_offset) in enumerate(
-                    audio_chunks(turn_audio, sample_rate, self.settings.asr_chunk_seconds), start=1
-                ):
-                    chunk_parts, warnings = self._transcribe_chunk(
-                        chunk,
-                        sample_rate,
-                        start_sample / sample_rate + local_offset,
-                        f"[{name}] 片段 {index} 分块 {chunk_index}",
-                    )
-                    parts.extend(chunk_parts)
-                    retry_warnings.extend(warnings)
-                texts.append(join_text(parts, language))
+            texts, retry_warnings = self._transcribe_turns(
+                waveform, sample_rate, turns, name, language
+            )
             recognized_at = perf_counter()
             timings[phase_name] = round(recognized_at - phase_started, 3)
             phase_name, phase_started = "assembly_seconds", recognized_at

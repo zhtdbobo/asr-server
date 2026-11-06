@@ -127,6 +127,7 @@ def test_cli_failure_exit_and_closes_client(tmp_path, monkeypatch):
 
     def create_pipeline(settings):
         assert settings.job_workers == 2
+        assert settings.asr_workers == 3
         assert settings.api_timeout_seconds == 90
         return pipeline
 
@@ -137,8 +138,10 @@ def test_cli_failure_exit_and_closes_client(tmp_path, monkeypatch):
                 str(tmp_path / "audio"),
                 "--output-dir",
                 str(tmp_path / "out"),
-                "--workers",
+                "--file-workers",
                 "2",
+                "--asr-workers",
+                "3",
                 "--timeout-seconds",
                 "90",
             ]
@@ -150,6 +153,7 @@ def test_cli_failure_exit_and_closes_client(tmp_path, monkeypatch):
     assert len(directories) == 1 and directories[0].is_dir()
     log = (directories[0] / "batch.log").read_text(encoding="utf-8")
     assert "Python：" in log and "本次配置：" in log
+    assert "2 个文件并发，每个文件 3 个 ASR 分块并发，ASR 请求合计最多 6 个" in log
     assert "[asr-file_0]" in log or "[asr-file_1]" in log
     assert "ASR unavailable" in log and "Traceback" in log
     assert "处理结束" in log
@@ -322,6 +326,15 @@ def test_invalid_or_empty_folder_does_not_call_services(tmp_path):
     with pytest.raises(ValueError, match="没有支持的音频"):
         batch.run_batch(tmp_path, tmp_path / "out", pipeline)
     assert pipeline.calls == []
+
+
+@pytest.mark.parametrize(
+    "arguments", [["--file-workers", "0"], ["--asr-workers", "0"], ["--workers", "2"]]
+)
+def test_cli_rejects_invalid_workers_and_removed_option(tmp_path, arguments):
+    with pytest.raises(SystemExit) as caught:
+        batch.main([str(tmp_path), *arguments])
+    assert caught.value.code == 2
 
 
 def test_output_directory_can_be_a_parent_of_input(tmp_path):

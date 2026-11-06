@@ -167,6 +167,7 @@ JSON 结果包含 `text`、`formatted_text`、`segments`、`diarization`、`spea
 
 ```dotenv
 JOB_WORKERS=2
+ASR_WORKERS=1
 MAX_PENDING_JOBS=100
 GPU_PENDING_REQUESTS=4
 ASR_CHUNK_SECONDS=30
@@ -174,6 +175,8 @@ API_TIMEOUT_SECONDS=600
 MAX_UPLOAD_MB=500
 MAX_AUDIO_SECONDS=3600
 ```
+
+`ASR_WORKERS` 控制每个文件内部的 ASR 分块并发数，默认 1；API 的文件并发由 `JOB_WORKERS` 控制，批处理使用 `--file-workers`，并可用 `--asr-workers` 覆盖 `ASR_WORKERS`。单个进程最多同时发出“文件并发数 × ASR 分块并发数”个 ASR 请求；请自行根据 ASR 服务容量选择这两个数值，不设置额外总上限或乘积校验。多个说话人片段及同一长片段的子块均可并发，返回结果按原时间顺序组装；异常块的二等分重试在原分块 worker 内执行，不增加并发槽位。分块失败后停止提交新块，等待已运行请求结束后再释放文件处理槽位。
 
 `ASR_CHUNK_SECONDS` 默认 30 秒，限制每个说话人片段内的 ASR 子块长度；长片段在低能量位置切分且不丢失片段内样本，识别后合并回原说话人片段。不同说话人分别调用 ASR，不跨说话人拼接音频。已取消对齐模型带来的 180 秒配置上限，实际值应结合 ASR 服务限制和生成预算设置。主流程先解码为 16 kHz 单声道，另存一份整段 PCM16 临时 WAV 上传给说话人服务，聚类完成后删除临时文件，保持整段录音的统一编号与原始时间轴；不再上传原始多通道大文件。16 kHz、16 位、8 通道音频总码率为 2048 kbps，每小时约 879 MiB；同采样率的单声道 PCM16 每小时约 110 MiB，默认一小时录音可在 GPU 服务的 500 MiB 文件限制内上传。对外 API 的原始上传大小仍由 `MAX_UPLOAD_MB` 控制。
 
@@ -252,8 +255,10 @@ D:/转写结果/
 默认处理当前文件夹的 WAV、MP3、M4A、FLAC、AAC、OGG、OPUS、WMA、AMR、AIFF 等音频，一次处理一个文件。包括子文件夹、同时处理两个文件：
 
 ```bash
-python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --recursive --workers 2
+python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --recursive --file-workers 2 --asr-workers 2
 ```
+
+`--file-workers 2` 同时处理两个文件，`--asr-workers 2` 让每个文件内部同时识别两个分块，合计最多四个 ASR 请求。两个参数均默认为 1（ASR 并发也可由 `.env` 的 `ASR_WORKERS` 设置）；原批处理参数 `--workers` 已移除。脚本启动时打印两层并发数及乘积，请按服务容量自行设置。
 
 每个音频保存以下结果，并保留输入子目录结构：
 
@@ -266,7 +271,7 @@ python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果" --recursiv
 续跑时使用 `--resume-dir` 指向已有的实际批次目录，自动启用 `--skip-existing`，复用对应 TXT 和有效 JSON，不新建批次目录：
 
 ```bash
-python batch_transcribe.py "D:/录音" --resume-dir "D:/转写结果/20261105_203015_a1b2c3d4" --recursive --workers 2
+python batch_transcribe.py "D:/录音" --resume-dir "D:/转写结果/20261105_203015_a1b2c3d4" --recursive --file-workers 2 --asr-workers 2
 ```
 
 旧版没有时间戳子目录的结果，也可以直接用 `--resume-dir "D:/旧转写结果"` 续跑。如果 JSON 来自旧版本的完整结果对象，会将其转为片段数组，并把原完整内容保存到 `.full.json`，不重复调用推理服务，TXT 保持原样；无效 JSON 或缺少 TXT/JSON 时重新处理。续跑会追加日志，汇总和耗时报告更新为本次执行的数据；跳过文件不会沿用旧模型耗时参与本次平均。单独给新批次加 `--skip-existing` 无法复用其他批次的结果。修改输入音频、模型或识别参数后，正常启动新批次重新处理。
@@ -308,7 +313,7 @@ ASR 在收到流式事件时每隔约 15 秒记录一次事件数、字符数和
 Community-1 的读写等待超时由 `.env` 的 `API_TIMEOUT_SECONDS` 控制，默认 600 秒，连接异常或部分临时 HTTP 错误最多尝试 3 次。可以在本次批处理中覆盖公共超时，例如：
 
 ```bash
-python batch_transcribe.py "D:/录音" --resume-dir "D:/转写结果/20261105_203015_a1b2c3d4" --timeout-seconds 120
+python batch_transcribe.py "D:/录音" --resume-dir "D:/转写结果/20261105_203015_a1b2c3d4" --file-workers 2 --asr-workers 2 --timeout-seconds 120
 ```
 
 ASR 单独使用 `ASR_TIMEOUT_SECONDS`，默认 90 秒，实际等待上限取它和公共超时的较小值；每收到一行流式数据也检查已耗时，持续生成超过该设置时关闭响应。HTTP 读写超时限制的是一次网络等待，并非严格的整段录音总时限。ASR 连接失败或超时不自动重复提交，避免旧生成尚未取消时继续堆积请求。若终端停留在某个阶段，结合对应服务日志检查该请求。
@@ -337,7 +342,56 @@ CUDA_VISIBLE_DEVICES=0 qwen-asr-serve \
 
 如果遇到 AliMeeting 原始多通道 WAV 上传 Community-1 时返回 HTTP 413，请将更新后的 `pipeline.py` 和 `clients.py` 同步到云桌面实际运行目录后，结束旧批处理，再用 `--resume-dir` 指定旧结果目录重新启动。主流程会上传整段单声道 PCM16，不需要单纯调大 GPU 上传限制。处理失败的文件会重试，已有有效 TXT/JSON 的文件会复用。
 
-`--workers` 控制本次脚本的并发文件数，独立于运行中的 API 进程；脚本和 API 同时运行时，远程服务承受两者合计的请求。此脚本是一次性批处理，不会持续监控目录，也不将任务写入 API 的 SQLite 队列。运行环境仍需基础 Python 依赖和 FFmpeg，模型和 GPU 继续位于服务器。
+`--file-workers` 控制本次脚本的并发文件数，`--asr-workers` 控制每个文件内部的 ASR 分块并发数，独立于运行中的 API 进程；脚本和 API 同时运行时，远程服务承受两者合计的请求。此脚本是一次性批处理，不会持续监控目录，也不将任务写入 API 的 SQLite 队列。运行环境仍需基础 Python 依赖和 FFmpeg，模型和 GPU 继续位于服务器。
+
+## MOSS 文件夹批量处理
+
+`batch_transcribe_moss.py` 单独调用 MOSS-Transcribe-Diarize 的 vLLM 接口，直接上传原始音频文件。客户端通过 `ffprobe` 检查大小和时长，不改采样率、声道、位深或音频时间轴。使用 MOSS 返回的原生说话人编号，不调用 Community-1，不自动切片。
+
+在本项目目录下运行，将服务器地址和本地录音目录改成实际值：
+
+```bash
+python batch_transcribe_moss.py "D:/录音" --api-url "http://10.130.1.6:8000/v1/audio/transcriptions" --model moss-mtd --output-dir "outputs/moss" --recursive --workers 1
+```
+
+客户端需已安装项目依赖，并将 FFmpeg 的 `bin` 目录加入 PATH，以便运行 `ffprobe`；模型只在远程服务中运行。`--model` 是服务对外公布的模型 ID，对应启动时的 `--served-model-name`，不是客户端的模型文件路径。
+
+也可在 `.env` 中设置 `MOSS_API_URL`、`MOSS_MODEL`、`MOSS_API_KEY`。命令行的地址和模型参数优先，鉴权密钥只从 `MOSS_API_KEY` 读取。此脚本不使用 Qwen 的 `ASR_API_URL` 或说话人服务配置。
+
+每次运行建立独立的时间戳批次目录，目录和文件名规则与之前的 Qwen 批处理一致：
+
+```text
+outputs/moss/20261106_103000_a1b2c3d4/
+├── batch.log
+├── batch-summary.json
+├── timing-report.txt
+├── 会议.wav.txt
+├── 会议.wav.json
+└── 会议.wav.full.json
+```
+
+- `.json`：仅包含 `speaker/start/end/text` 的片段数组，时间单位为原录音上的秒数；按开始时间排序，保留说话人编号、标点和重叠片段，不合并分段。可直接交给 `compare_transcripts.py`。
+- `.full.json`：保留接口完整响应字段和原始 `segments`（包括 `id/type`），增加可读正文、说话人显示名称、输入音频信息和客户端阶段耗时。
+- `.txt`：与之前相同的“发言人、时间戳、正文”排版；显示名称按首次发言排序，JSON 中仍保留 `S01/S02` 等模型编号。
+- 批次报告记录成功、失败、跳过、逐文件和平均耗时。MOSS 联合完成转写和说话人识别，因此报告记录音频检查、MOSS 请求、响应组装和写入耗时；不拆出独立的 ASR/说话人模型耗时。HTTP 请求耗时包含上传、排队、推理和下载，并非纯 GPU 时间。
+
+**大小与时长限制：**脚本默认允许原文件最大 500 MiB、时长最大 5400 秒（90 分钟）；检查不通过时不上传、不截断，记录该文件失败并继续处理其他文件。vLLM 的默认上传上限为 25 MB，因此需要在服务端创建容器时加上 `-e VLLM_MAX_AUDIO_CLIP_FILESIZE_MB=500`，与脚本的 `--max-upload-mb 500` 一致。改变已有容器的环境变量需要重新创建容器，仅执行 `docker restart` 不会修改它。大小限制依据见 [vLLM 0.33.0 文档](https://docs.vllm.ai/en/v0.33.0/serving/online_serving/speech_to_text/)，90 分钟单次推理能力见 [MOSS 模型说明](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize)。
+
+文件大小上限不等于模型上下文上限；实际可处理时长仍受服务上下文长度、显存和输出 token 数限制。脚本默认 `--max-completion-tokens 32768`、`--timeout-seconds 1800`，可按服务容量调整。可选 `--language zh` 和 `--prompt "提示词"` 会原样传给模型；对比实验需统一记录提示词和参数。
+
+续跑某个实际批次目录（自动复用有效 TXT/JSON），不会重复提交已有成功结果：
+
+```bash
+python batch_transcribe_moss.py "D:/录音" --api-url "http://10.130.1.6:8000/v1/audio/transcriptions" --resume-dir "outputs/moss/20261106_103000_a1b2c3d4" --recursive
+```
+
+超时或 HTTP 错误不会自动重试整段推理；可以检查服务后续跑。退出码为 0 表示全部成功或跳过，为 1 表示有失败。切换模型、录音或生成参数后应创建新批次，续跑只用于相同配置。
+
+使用与之前相同的 reference 对比，只需将 `--hypothesis` 指向这次 MOSS 的实际批次目录：
+
+```bash
+python compare_transcripts.py --reference "outputs/reference/Eval_Ali/Eval_Ali_far/textgrid_dir" --hypothesis "outputs/moss/20261106_103000_a1b2c3d4" --output-dir "outputs/comparison-moss"
+```
 
 ## AliMeeting 标注转 JSON
 
