@@ -344,6 +344,59 @@ CUDA_VISIBLE_DEVICES=0 qwen-asr-serve \
 
 `--file-workers` 控制本次脚本的并发文件数，`--asr-workers` 控制每个文件内部的 ASR 分块并发数，独立于运行中的 API 进程；脚本和 API 同时运行时，远程服务承受两者合计的请求。此脚本是一次性批处理，不会持续监控目录，也不将任务写入 API 的 SQLite 队列。运行环境仍需基础 Python 依赖和 FFmpeg，模型和 GPU 继续位于服务器。
 
+## FireRedASR2 / Nemotron 文件夹批量处理
+
+上面 `batch_transcribe.py` 默认对接 Qwen3-ASR 的流式接口。若改用 **FireRedASR2（普通 JSON，自带标点）**，并提供两套说话人分离方案，可直接使用以下两个脚本；它们复用 `batch_transcribe.py` 的全部批处理与报告逻辑，仅替换 ASR / 说话人分离客户端。
+
+| 脚本 | ASR | 说话人分离 | 配置文件 |
+|---|---|---|---|
+| `batch_transcribe_firered.py` | FireRedASR2（含标点） | Community-1 | `.env.firered`（优先）/ `.env` |
+| `batch_transcribe_nemotron.py` | FireRedASR2（含标点） | Nemotron-3-Diarization | `.env.nemotron`（优先）/ `.env` |
+
+脚本存在同名配置文件时优先加载并覆盖 `.env`，因此两份配置互不干扰。`--file-workers` / `--asr-workers` / `--recursive` / `--resume-dir` / `--skip-existing` / `--language` / `--num-speakers` 等参数与 `batch_transcribe.py` 完全一致。
+
+### 配置（`.env.firered` / `.env.nemotron`）
+
+```dotenv
+# FireRedASR2 服务（普通 JSON，/v1/audio/transcriptions；无 /v1/models，必须填 ASR_MODEL）
+ASR_API_URL=http://127.0.0.1:8004/v1/audio/transcriptions
+ASR_MODEL=fireredasr2
+
+# 说话人分离服务：firered 版填 Community-1，nemotron 版填 Nemotron
+# Community-1（.env.firered）：
+DIARIZATION_API_URL=http://127.0.0.1:8002/v1/diarization
+# Nemotron-3-Diarization（.env.nemotron）：
+# DIARIZATION_API_URL=http://127.0.0.1:8006/v1/audio/diarizations
+```
+
+### 真实运行样例
+
+Community-1 分离 + FireRedASR2（AliMeeting 远端测试集，两个文件并发、文件内两块并发）：
+
+```bash
+python batch_transcribe_firered.py "C:\lyb\datasets\AliMeeting\Eval_Ali\Eval_Ali_far\audio_dir" --output-dir "outputs/transcribe" --recursive --file-workers 2 --asr-workers 2
+```
+
+Nemotron-3 分离 + FireRedASR2（同一测试集，4 并发）：
+
+```bash
+python batch_transcribe_nemotron.py "C:\lyb\datasets\AliMeeting\Eval_Ali\Eval_Ali_far\audio_dir" --output-dir "outputs/transcribe" --recursive --file-workers 4 --asr-workers 4
+```
+
+处理 AiShell 测试集（`wav/` 目录下为 16kHz 8 声道 `.flac`，扩展名白名单已含 `.flac`）：
+
+```bash
+python batch_transcribe_nemotron.py "C:\lyb\datasets\AiShell\test\wav" --output-dir "outputs/transcribe" --file-workers 1 --asr-workers 1
+```
+
+先跑单个文件验证（每个会议约 40 分钟，20 个文件耗时较长）：
+
+```bash
+python batch_transcribe_nemotron.py "输出单个 flac 的目录" --output-dir "outputs/transcribe" --file-workers 1 --asr-workers 1
+```
+
+输出结构、`--resume-dir` 续跑、`timing-report.txt` 分阶段耗时、退出码规则等与 `batch_transcribe.py` 相同（见上一节）。注意 `--file-workers × --asr-workers` 是同时在途的 ASR 请求总量，需按 GPU 显存设置；长音频并发过高会 OOM。
+
 ## MOSS 文件夹批量处理
 
 `batch_transcribe_moss.py` 单独调用 MOSS-Transcribe-Diarize 的 vLLM 接口，直接上传原始音频文件。客户端通过 `ffprobe` 检查大小和时长，不改采样率、声道、位深或音频时间轴。使用 MOSS 返回的原生说话人编号，不调用 Community-1，不自动切片。
