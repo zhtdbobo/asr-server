@@ -422,6 +422,24 @@ python textgrid_to_json.py "D:/AliMeeting/Eval_Ali" --output-dir "outputs/refere
 
 人工标注的 `SPKxxxx` 与模型输出的聚类 ID、`发言人1` 等编号没有直接对应关系，对比说话人归属前需要按当前录音建立映射。参考标注按原始片段保存，模型结果可能合并多个片段，对比文本或时间戳时应按时间轴对齐。远场 WAV 文件名还可能包含额外的麦克风后缀，匹配 JSON 与音频时请核对会议编号。
 
+## AISHELL 测试集标注转 JSON
+
+AISHELL 测试集的 `TextGrid` 目录可直接用 AliMeeting 的 `textgrid_to_json.py` 转换。在仓库根目录用 PowerShell 运行：
+
+```powershell
+.\.venv\Scripts\python.exe textgrid_to_json.py "D:\Datasets\aishell\test\TextGrid" --output-dir "outputs/reference/aishell/test"
+```
+
+已验证该目录下的 20 个 TextGrid 均可转换，生成的 JSON 与 `wav` 目录下的 FLAC 文件同名。JSON 保留 `006-M` 等说话人层名、原始起止时间、重叠片段和标注文本。参考文本取自 TextGrid。
+
+这批标注中出现了 `<sil>`、`<$>`、`<#>`、`<->`、`<%>`、`<_>`，以及 `&嗯&` 等写法。默认 CER 归一化会移除符号，但会把 `<sil>` 中的 `sil` 当作正文计分。评估时可通过 `--ignore-pattern` 移除完整的尖括号标记。把下面的 `--hypothesis` 改为实际转写批次目录：
+
+```powershell
+.\.venv\Scripts\python.exe compare_transcripts.py --reference "outputs/reference/aishell/test" --hypothesis "outputs/transcribe/实际批次目录" --output-dir "outputs/comparison-aishell" --ignore-pattern '<(?:sil|[$#%_-])>'
+```
+
+该参数只影响 CER 的文本归一化。`&嗯&` 中的“嗯”仍参与计分，原始 JSON 和 DER 使用的时间段保持原样。
+
 ## 识别结果与 reference 对比
 
 `compare_transcripts.py` 只使用 Python 标准库，无需 GPU 或安装额外依赖。比较远场识别结果和之前生成的远场 reference，Windows PowerShell/CMD 均可运行下面这一行：
