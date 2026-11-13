@@ -107,7 +107,7 @@ class FireRedServiceClients:
                 time.sleep(0.5 * (attempt + 1))
                 continue
 
-            if response.status_code in (429, 502, 503, 504) and attempt < 2:
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
                 logger.warning("FireRed 第 %d/3 次返回 HTTP %d，重试", attempt + 1, response.status_code)
                 time.sleep(0.5 * (attempt + 1))
                 continue
