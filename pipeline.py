@@ -78,10 +78,10 @@ def audio_chunks(waveform, sample_rate: int, max_seconds: float):
 class MeetingPipeline:
     """CPU orchestrator for diarization followed by ASR of each speaker turn."""
 
-    def __init__(self, settings: Settings | None = None, clients=None):
+    def __init__(self, settings: Settings | None = None, clients=None, *, slots=None):
         self.settings = settings or Settings.from_env()
         self.clients = clients if clients is not None else ServiceClients(self.settings)
-        self._slots = BoundedSemaphore(self.settings.job_workers)
+        self._slots = slots if slots is not None else BoundedSemaphore(self.settings.job_workers)
 
     @property
     def loaded(self):

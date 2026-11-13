@@ -38,7 +38,11 @@ class ControlledPipeline:
 def test_queued_job_lifecycle_backpressure_and_auth(tmp_path):
     engine = ControlledPipeline()
     settings = Settings(
-        job_directory=str(tmp_path), job_workers=1, max_pending_jobs=1, service_api_key="public-key"
+        job_directory=str(tmp_path),
+        job_workers=1,
+        max_pending_jobs=1,
+        service_api_key="public-key",
+        default_backend="qwen-community1",
     )
     with TestClient(create_app(engine, settings)) as client:
         assert client.post("/v1/jobs", files={"file": ("a.wav", b"audio")}).status_code == 401
@@ -64,7 +68,8 @@ def test_failed_job_and_bad_upload_cleanup(tmp_path):
     engine = ControlledPipeline()
     engine.error = RuntimeError("upstream unavailable")
     engine.release.set()
-    with TestClient(create_app(engine, Settings(job_directory=str(tmp_path)))) as client:
+    settings = Settings(job_directory=str(tmp_path), default_backend="qwen-community1")
+    with TestClient(create_app(engine, settings)) as client:
         assert client.post("/v1/jobs", files={"file": ("empty.wav", b"")}).status_code == 400
         job_id = client.post("/v1/jobs", files={"file": ("a.wav", b"audio")}).json()["id"]
         status = wait_status(client, job_id, "failed")

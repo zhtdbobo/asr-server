@@ -27,7 +27,12 @@ class FakePipeline:
 def endpoint(tmp_path):
     pipeline = FakePipeline()
     with TestClient(
-        create_app(pipeline, Settings(max_upload_mb=1, job_directory=str(tmp_path)))
+        create_app(
+            pipeline,
+            Settings(
+                max_upload_mb=1, job_directory=str(tmp_path), default_backend="qwen-community1"
+            ),
+        )
     ) as client:
         yield client, pipeline
 
@@ -45,6 +50,30 @@ def test_json_upload_and_cleanup(endpoint):
     assert options["num_speakers"] == 3
     assert body == b"audio-data"
     assert not path.exists()
+
+
+def test_backend_selection(tmp_path, monkeypatch):
+    qwen, firered = FakePipeline(), FakePipeline()
+    monkeypatch.setattr("app.MeetingPipeline", lambda *args, **kwargs: firered)
+    monkeypatch.setattr("app.FireRedNemotronClients", lambda settings: object())
+    settings = Settings(
+        job_directory=str(tmp_path),
+        firered_asr_api_url="http://firered/transcriptions",
+        nemotron_diarization_api_url="http://nemotron/diarization",
+    )
+    with TestClient(create_app(qwen, settings)) as client:
+        files = {"file": ("meeting.wav", b"audio")}
+        url = "/v1/audio/transcriptions"
+        assert client.post(url, files=files).status_code == 200
+        assert client.post(url, files=files, data={"backend": "qwen-community1"}).status_code == 200
+        assert client.post(url, files=files, data={"backend": "unknown"}).status_code == 422
+        response = client.post("/v1/jobs", files=files, data={"backend": "qwen-community1"})
+        assert response.status_code == 202
+        with client.app.state.jobs.connect() as db:
+            options = db.execute("SELECT options FROM jobs").fetchone()[0]
+        assert '"backend": "qwen-community1"' in options
+        assert len(firered.calls) == 1
+        assert qwen.calls
 
 
 def test_text_response(endpoint):

@@ -1,8 +1,7 @@
 .git
 .venv
 .cache
-.env
-.env.gpu
+.env*
 models
 outputs
 tests

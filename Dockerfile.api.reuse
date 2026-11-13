@@ -1,0 +1,8 @@
+ARG API_BASE=meeting-api:base-20261104
+FROM ${API_BASE}
+WORKDIR /app
+COPY pyproject.toml *.py ./
+COPY swagger_assets ./swagger_assets
+RUN python -m pip install . && python -m pip check
+EXPOSE 8001
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]

@@ -3,7 +3,7 @@
 复用你已经部署的 `POST /v1/audio/transcriptions`：通过 multipart 上传音频，传入 `model`、`response_format=json`、`stream=true`、`temperature=0` 和 `max_completion_tokens`，读取 SSE 转写事件并汇总为正文。流式读取用于提前停止异常生成及识别截断。本项目先用 Community-1 对整段录音进行说话人分段，再按其起止时间切音频、分别调用 ASR，不需要强制对齐模型。本项目不加载 Qwen3-ASR 权重。
 
 ```text
-云桌面：Python 主 API :8010 / 持久化任务队列
+云桌面：Python 主 API :8001 / 持久化任务队列
          → 服务器 10.130.1.6:8002：Community-1，整段录音说话人分段与聚类
          → 主 API 按说话人时间段切音频，长片段再细分
          → 服务器 10.130.1.6:8001：已有 Qwen3-ASR，逐段识别正文
@@ -45,7 +45,7 @@ DIARIZATION_DEVICE=cuda:0
 
 云桌面 `.env` 的 `SERVICE_API_KEY` 控制对外任务与转写接口；设置后调用时加 `Authorization: Bearer <key>`。如果启用 GPU 服务鉴权，云桌面 `.env` 与服务器 `.env.gpu` 中的 `INTERNAL_API_KEY` 必须相同；留空表示不开启。
 
-主 API 直接在云桌面监听 8010，不需要构建 API 镜像。若服务器上仍运行旧版主 API 容器，请先用旧版 Compose 停止 `api`，或单独停止对应的旧主 API 容器，再使用新版配置启动 GPU 服务。
+主 API 直接在云桌面监听 8001，不需要构建 API 镜像。若服务器上仍运行旧版主 API 容器，请先用旧版 Compose 停止 `api`，或单独停止对应的旧主 API 容器，再使用新版配置启动 GPU 服务。
 
 ## 下载与离线部署
 
@@ -93,7 +93,7 @@ docker compose --env-file .env.gpu logs -f
 
 必须保留 `--env-file .env.gpu`：它用于替换 Compose 中的物理 GPU 编号；服务的 `env_file: .env.gpu` 则把模型路径等设置传入容器。修改 GPU 配置后重新执行上面的启动命令会更新容器。
 
-GPU 服务启动时加载模型；健康后，按后面的步骤启动云桌面主 API。GPU 文档位于 `http://10.130.1.6:8002/docs`，主 API 文档在云桌面的 `http://localhost:8010/docs`。本项目两个服务的 `/docs` 均使用随代码、镜像打包的 Swagger UI 静态文件，浏览器无需访问外网 CDN。API 的 `/health` 表示进程存活，不代表已验证远程服务可访问。
+GPU 服务启动时加载模型；健康后，按后面的步骤启动云桌面主 API。GPU 文档位于 `http://10.130.1.6:8002/docs`，主 API 文档在云桌面的 `http://localhost:8001/docs`。本项目两个服务的 `/docs` 均使用随代码、镜像打包的 Swagger UI 静态文件，浏览器无需访问外网 CDN。API 的 `/health` 表示进程存活，不代表已验证远程服务可访问。
 
 如果日志显示 `/docs` 为 200 但旧版页面空白，可更新主 API 代码或 GPU 镜像，再强制刷新浏览器。如果任务报 ASR HTTP 404，请先核对 `ASR_API_URL`，再核对 `ASR_MODEL` 是否与 `GET http://ASR服务器:8001/v1/models` 返回的 `data[].id` 完全一致。新版任务错误会附上服务名、HTTP 状态码和上游错误原因。修改云桌面的 `.env` 后重启 Python 主 API 进程。
 
@@ -116,10 +116,18 @@ docker compose --env-file .env.gpu rm -f aligner
 
 ## 对外调用
 
+主 API 的两个上传接口 `/v1/audio/transcriptions` 和 `/v1/jobs` 都接受 multipart 表单字段 `backend`。省略时默认使用 `firered-nemotron`，传入 `qwen-community1` 可切换到 Qwen + Community-1。也可以通过 `DEFAULT_BACKEND` 调整服务默认值。FireRed + Nemotron 使用 `FIRERED_ASR_API_URL` 和 `NEMOTRON_DIARIZATION_API_URL`，模型名和鉴权配置见 `.env.example`。未配置该组合时返回 HTTP 503。异步任务会保存提交时选定的组合。
+
+```bash
+curl http://localhost:8001/v1/audio/transcriptions -F "file=@meeting.wav" -F "backend=qwen-community1"
+```
+
+主 API 和上游 Qwen 可以在不同机器上都使用 8001。如果部署在同一台机器上，请给主 API 分配不同的宿主机端口，例如 Docker 的 `-p 8010:8001`。
+
 大批量调用使用异步任务接口。上传完整音频后立即得到任务 ID：
 
 ```bash
-curl http://localhost:8010/v1/jobs \
+curl http://localhost:8001/v1/jobs \
   -F 'file=@meeting.wav' -F 'num_speakers=3'
 ```
 
@@ -132,8 +140,8 @@ curl http://localhost:8010/v1/jobs \
 使用 **GET** 查询进度、获取你需要的纯文本；查询地址使用 POST 会返回 405：
 
 ```bash
-curl http://localhost:8010/v1/jobs/任务ID
-curl 'http://localhost:8010/v1/jobs/任务ID/result?response_format=text'
+curl http://localhost:8001/v1/jobs/任务ID
+curl 'http://localhost:8001/v1/jobs/任务ID/result?response_format=text'
 ```
 
 任务状态为 `uploading`、`queued`、`running`、`completed`、`failed`。结果尚未完成时返回 202，失败时结果接口返回 409，状态中的 `error` 提供原因。任务队列已满时提交返回 429 和 `Retry-After`。
@@ -141,7 +149,7 @@ curl 'http://localhost:8010/v1/jobs/任务ID/result?response_format=text'
 同步调试接口仍然可用：
 
 ```bash
-curl http://localhost:8010/v1/audio/transcriptions \
+curl http://localhost:8001/v1/audio/transcriptions \
   -F 'file=@meeting.wav' -F 'num_speakers=3' -F 'response_format=text'
 ```
 
@@ -196,7 +204,7 @@ SQLite 队列支持单节点持久化和重启恢复：运行中断的任务重�
 
 ```bash
 uv sync
-uv run --no-sync python -m uvicorn app:app --host 0.0.0.0 --port 8010 --workers 1
+uv run --no-sync python -m uvicorn app:app --host 0.0.0.0 --port 8001 --workers 1
 ```
 
 批处理也可直接通过 uv 运行：
@@ -210,10 +218,10 @@ uv run --no-sync python batch_transcribe.py "D:/录音" --output-dir "D:/转写�
 如果基础依赖已经通过离线包安装，也可从项目根目录直接运行：
 
 ```bash
-python -m uvicorn app:app --host 0.0.0.0 --port 8010 --workers 1
+python -m uvicorn app:app --host 0.0.0.0 --port 8001 --workers 1
 ```
 
-在云桌面浏览器访问 `http://localhost:8010/docs`；其他客户端访问 `http://云桌面IP:8010`。确认云桌面能访问 GPU 服务器的 8001、8002 端口。录音、任务队列和结果保存在云桌面，模型文件仅在 GPU 服务器上。
+在云桌面浏览器访问 `http://localhost:8001/docs`；其他客户端访问 `http://云桌面IP:8001`。确认云桌面能访问 GPU 服务器的 8001、8002 端口。录音、任务队列和结果保存在云桌面，模型文件仅在 GPU 服务器上。
 
 `uv sync` 首次安装需要访问可用的 Python 包源，单独复制源码不能替代依赖安装。完全离线的云桌面需提前准备依赖包；在与云桌面操作系统、Python 版本和架构匹配的联网环境准备 wheel 包：
 
@@ -233,7 +241,7 @@ FFmpeg 需另外准备并加入云桌面的 PATH。
 
 ## 文件夹批量处理
 
-云桌面可直接运行 `batch_transcribe.py`，读取主 API 的 `.env` 并调用远程 ASR 和说话人两个推理服务，无需先启动 8010 API：
+云桌面可直接运行 `batch_transcribe.py`，读取主 API 的 `.env` 并调用远程 ASR 和说话人两个推理服务，无需先启动 8001 API：
 
 ```bash
 python batch_transcribe.py "D:/录音" --output-dir "D:/转写结果"

@@ -25,8 +25,16 @@ class Settings:
     merge_gap_seconds: float = 1.5
     max_upload_mb: int = 500
     max_audio_seconds: float = 3600
+    firered_asr_api_url: str = ""
+    firered_asr_model: str = ""
+    firered_asr_api_key: str = field(default="", repr=False)
+    nemotron_diarization_api_url: str = ""
+    nemotron_api_key: str = field(default="", repr=False)
+    default_backend: str = "firered-nemotron"
 
     def __post_init__(self):
+        if self.default_backend not in ("qwen-community1", "firered-nemotron"):
+            raise ValueError("DEFAULT_BACKEND 必须为 qwen-community1 或 firered-nemotron")
         if not math.isfinite(self.merge_gap_seconds) or self.merge_gap_seconds < 0:
             raise ValueError("merge_gap_seconds 必须是大于等于 0 的有限数字")
         for name in (
